@@ -84,6 +84,7 @@ This project will be completed over **6 weeks**, with deliverables including:
 │── /api # FastAPI service
 │── /ui # React + Tauri front-end
 │── /db # Postgres schema + migrations
+│── /etl # ETL scripts (Python jobs, pipelines)
 |── /artifacts #documentation and original .ipynb file
 │   └── images/          # Exported diagrams and figures
 │── docker-compose.yml

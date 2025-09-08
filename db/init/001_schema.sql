@@ -70,6 +70,10 @@ group by 1,2;
 create index if not exists ix_fm_year on ml.feature_matrix(year);
 create index if not exists ix_fm_geo  on ml.feature_matrix(geo_code);
 
+-- required for REFRESH MATERIALIZED VIEW CONCURRENTLY
+CREATE UNIQUE INDEX IF NOT EXISTS uq_fm_geo_year
+  ON ml.feature_matrix(geo_code, year);
+
 -- If you prefer an always-live VIEW instead of an MV, uncomment below and
 -- drop the MV above. The MV is faster for modeling; the VIEW is always fresh.
 -- create or replace view ml.features as
