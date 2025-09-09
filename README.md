@@ -59,10 +59,42 @@ This project demonstrates all five CS 499 outcomes:
 ---
 
 ## 📊 System Design Visualization
-A full architecture diagram is included in the design document:
 
-![Capstone Design Document (PNG)](/artifacts/images/Capstone_Design_Document.png)
-👉 [Download the full Capstone Design Document (PDF)](Capstone_Design_Document.pdf)
+This section presents the three key architecture views that support the platform design.  
+Each visualization highlights a different perspective of the system.
+
+---
+
+### 🛠️ From CS-370 Prototype to Capstone
+Planned enhancements that extend the original Q-learning artifact into a full platform.
+
+![Capstone Design Document](artifacts/images/Capstone_Design_Document.png)
+
+---
+
+### 🏗️ System Architecture
+High-level view of external data sources, ETL, storage, training, API, and UI layers.
+
+![System Architecture](artifacts/images/System_Architecture.png)
+
+---
+
+### 🔄 Request → Predict → Visualize
+Sequence of interactions from user input to prediction to chart rendering.
+
+![Request → Predict → Visualize](artifacts/images/Request_Predict_Visualize.png)
+
+---
+
+### 📈 ETL Training Loop
+Data ingestion, staging, feature matrix refresh, and model training flow.
+
+![ETL Training Loop](artifacts/images/ETL_Training_Loop.png)
+
+---
+
+👉 [Download the full Capstone Design Document (PDF)](artifacts/images/Capstone_Design_Document.pdf)
+
 ---
 
 ## 🚀 Roadmap
@@ -89,3 +121,5 @@ This project will be completed over **6 weeks**, with deliverables including:
 │   └── images/          # Exported diagrams and figures
 │── docker-compose.yml
 │── requirements.txt
+
+
