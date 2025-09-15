@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "population-prediction-platform"
+version = "0.1.0"
+requires-python = ">=3.10"
+description = "A Population Prediction Platform that leverages various API data sources to predict future population values."
+readme = "README.md"
+authors = [{ name = "Nicholas Kreuziger" }]
+
+# shared deps
+dependencies = [
+        "python-dotenv>=1.0.1",
+        "psycopg2-binary>=2.9.9",
+]
+
+[project.optional-dependencies]
+api = [
+        "fastapi==0.115.2",
+        "uvicorn==0.30.6",
+        "SQLAlchemy==2.0.36",
+        "pydantic==2.9.2"
+]
+etl = [
+        "requests==2.32.3",
+        "pandas==2.2.2",
+        "polars==1.6.0"
+]
+
+dev = ["pytest", "ruff", "black", "mypy"]
+
+[project.scripts]
+ppp-api = "ppp_api.main:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ppp_common", "src/ppp_api", "src/ppp_etl"]

@@ -1,18 +1,17 @@
 FROM python:3.11-slim
-
-# system deps for psycopg and builds
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential gcc curl && \
-    rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 
-# copy requirements separately to leverage Docker layer caching
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# copy just dependency metadata first for caching
+COPY pyproject.toml /app/
+COPY src /app/src
+#copy README
+COPY pyproject.toml README.md /app/
+COPY src /app/src
 
-# app code
-COPY app ./app
 
+# install API extras (brings in base + api deps)
+RUN pip install --no-cache-dir -e ".[api]"
+
+#expose port for API
 EXPOSE 8000
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "ppp_api.main:app", "--host", "0.0.0.0", "--port", "8000"]
