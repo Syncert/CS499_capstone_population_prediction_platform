@@ -7,18 +7,37 @@ create schema if not exists core;
 create schema if not exists ml;
 
 -- ─────────────────────────────────────────────────────────
+-- core.geography
+--
+-- Reference table for names/types (for clean joins later)
+-- ─────────────────────────────────────────────────────────
+
+create table if not exists core.geography (
+  geo_code varchar(32) primary key,
+  geo_name text not null,
+  geo_type varchar(16) not null   -- e.g. 'nation','state','county','place'
+);
+
+-- ─────────────────────────────────────────────────────────
+-- core.population_observations
+--
 -- Population ground truth
 -- ─────────────────────────────────────────────────────────
 create table if not exists core.population_observations (
   geo_code varchar(32) not null,
   year     int         not null,
-  population bigint,
-  primary key (geo_code, year)
+  population bigint    not null,
+  primary key (geo_code, year),
+  foreign key (geo_code) references core.geography(geo_code),
+  constraint chk_population_positive check (population >= 0),
+  constraint chk_year_reasonable check (year between 1900 and 2100)
 );
 
 create index if not exists idx_pop_year on core.population_observations(year);
 
 -- ─────────────────────────────────────────────────────────
+-- core.indicator_values
+--
 -- Long/tidy indicator store (minimal schema churn)
 -- One row per (geo, year, indicator_code)
 -- ─────────────────────────────────────────────────────────
@@ -31,7 +50,8 @@ create table if not exists core.indicator_values (
   unit           varchar(32),            -- 'percent','index','count', etc.
   etl_batch_id   varchar(64),
   updated_at     timestamptz default now(),
-  primary key (geo_code, year, indicator_code)
+  primary key (geo_code, year, indicator_code),
+  foreign key (geo_code) references core.geography(geo_code)
 );
 
 create index if not exists ix_indic_year on core.indicator_values(year);
@@ -47,7 +67,7 @@ create table if not exists core.indicator_catalog (
 );
 
 -- ─────────────────────────────────────────────────────────
--- Modeling matrix (pivot the shortlist you’ll start with)
+-- Modeling matrix
 -- Use a MATERIALIZED VIEW so you can refresh after ETL.
 -- Add/remove indicators here without touching storage tables.
 -- ─────────────────────────────────────────────────────────
@@ -74,13 +94,9 @@ create index if not exists ix_fm_geo  on ml.feature_matrix(geo_code);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_fm_geo_year
   ON ml.feature_matrix(geo_code, year);
 
--- If you prefer an always-live VIEW instead of an MV, uncomment below and
--- drop the MV above. The MV is faster for modeling; the VIEW is always fresh.
--- create or replace view ml.features as
--- select * from ml.feature_matrix;
 
 -- ─────────────────────────────────────────────────────────
--- Convenience upsert function (optional)
+-- Upsert function
 -- Lets you idempotently load indicator rows from ETL.
 -- ─────────────────────────────────────────────────────────
 create or replace function core.upsert_indicator_value(
