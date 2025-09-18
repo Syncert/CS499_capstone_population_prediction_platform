@@ -7,7 +7,10 @@ from ppp_common.orm import engine
 from ..lib.util import batch_id, artifacts_dir, write_json
 from time import sleep
 from requests.adapters import HTTPAdapter, Retry
+from ..lib.layers import write_raw_event, write_stg_frame
+import json
 
+# ---- Config: Census API Key ----
 #API Key
 CENSUS_KEY = os.getenv("CENSUS_API_KEY")
 
@@ -55,14 +58,39 @@ def _avail(year: int, survey: str) -> bool:
     except requests.RequestException:
         return False
 
+
 def _get(year: int, survey: str, params: dict) -> list[list[str]]:
     url = _acs_url(year, survey)
-    params = dict(params)  # copy
+    params = dict(params)
     if CENSUS_KEY:
         params["key"] = CENSUS_KEY
+
     r = SESSION.get(url, params=params, timeout=60)
+    raw_text = r.text  # keep for logging
+
+    # Try hard to parse JSON: first r.json(), then json.loads(text).
+    try:
+        rj = r.json()
+    except Exception:
+        try:
+            rj = json.loads(raw_text)
+        except Exception:
+            rj = {"non_json_body": raw_text[:1024]}
+
+    # RAW call audit (log what we actually saw)
+    write_raw_event(
+        raw_table="raw.acs_calls",
+        batch_id=os.getenv("PPP_BATCH_ID", "unknown"),
+        endpoint=url,
+        params={k: v for k, v in params.items() if k != "key"},
+        payload=None,
+        response_json=rj if isinstance(rj, (dict, list)) else {"non_json_body": str(rj)[:1024]},
+        status_code=r.status_code,
+        notes=f"{survey} {year} params={{{','.join(sorted(params.keys()))}}}"
+    )
+
     r.raise_for_status()
-    js = r.json()
+    js = rj
     if not (isinstance(js, list) and js and isinstance(js[0], list)):
         raise ValueError(f"Census API error for {survey} {year}: {js}")
     return js
@@ -136,6 +164,19 @@ def extract_us(year: int, survey: str) -> pl.DataFrame:
     hdr, *rows = js
     i = _index_or_die(hdr, ["NAME", VAR])
     rec = rows[0]
+
+    # RAW rows
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO raw.acs_rows (etl_batch_id, dataset, year, geo_level, state_fips,
+                                      geo_code, geo_name, var_code, raw_value)
+            VALUES (:batch, :ds, :yr, 'us', NULL, 'US', :name, :var, :val)
+            ON CONFLICT DO NOTHING;
+        """), {
+            "batch": os.getenv("PPP_BATCH_ID","unknown"), "ds": survey, "yr": year,
+            "name": rec[i["NAME"]], "var": VAR, "val": rec[i[VAR]]
+        })
+
     return pl.DataFrame({
         "geo_code": ["US"],
         "geo_name": [rec[i["NAME"]]],
@@ -149,6 +190,30 @@ def extract_states(year: int, survey: str) -> pl.DataFrame:
     js = _get(year, survey, {"get": f"NAME,{VAR}", "for": "state:*"})
     hdr, *rows = js
     i = {c: k for k, c in enumerate(hdr)}
+
+    # RAW rows (one per state)
+    with engine.begin() as conn:
+        payload = [{
+            "batch": os.getenv("PPP_BATCH_ID", "unknown"),
+            "ds": survey,
+            "yr": year,
+            "geo_level": "state",
+            "state_fips": row[i["state"]],
+            "geo_code": row[i["state"]],
+            "geo_name": row[i["NAME"]],
+            "var": VAR,
+            "val": row[i[VAR]],
+        } for row in rows]
+        conn.execute(text("""
+            INSERT INTO raw.acs_rows (
+                etl_batch_id, dataset, year, geo_level, state_fips,
+                geo_code, geo_name, var_code, raw_value
+            )
+            VALUES (:batch, :ds, :yr, :geo_level, :state_fips,
+                    :geo_code, :geo_name, :var, :val)
+            ON CONFLICT DO NOTHING;
+        """), payload)
+
     return pl.DataFrame({
         "geo_code": [row[i["state"]] for row in rows],  # 2-digit FIPS
         "geo_name": [row[i["NAME"]] for row in rows],
@@ -162,15 +227,43 @@ def extract_counties(year: int, survey: str) -> pl.DataFrame:
     frames: list[pl.DataFrame] = []
     for ss in _state_fips_list():
         try:
-            js = _get(year, survey,
-                      {"get": f"NAME,{VAR}", "for": "county:*", "in": f"state:{ss}"})
+            js = _get(year, survey, {
+                "get": f"NAME,{VAR}",
+                "for": "county:*",
+                "in": f"state:{ss}"
+            })
         except Exception as e:
             print(f"[WARN] {survey} {year} state {ss}: {e}")
             continue
+
         hdr, *rows = js
         if not rows:
             continue
         i = {c: k for k, c in enumerate(hdr)}
+
+        # RAW rows (one per county)
+        with engine.begin() as conn:
+            payload = [{
+                "batch": os.getenv("PPP_BATCH_ID", "unknown"),
+                "ds": survey,
+                "yr": year,
+                "geo_level": "county",
+                "state_fips": row[i["state"]],
+                "geo_code": f"{row[i['state']]}{row[i['county']]}",
+                "geo_name": row[i["NAME"]],
+                "var": VAR,
+                "val": row[i[VAR]],
+            } for row in rows]
+            conn.execute(text("""
+                INSERT INTO raw.acs_rows (
+                    etl_batch_id, dataset, year, geo_level, state_fips,
+                    geo_code, geo_name, var_code, raw_value
+                )
+                VALUES (:batch, :ds, :yr, :geo_level, :state_fips,
+                        :geo_code, :geo_name, :var, :val)
+                ON CONFLICT DO NOTHING;
+            """), payload)
+
         frames.append(pl.DataFrame({
             "geo_code": [f"{row[i['state']]}{row[i['county']]}" for row in rows],
             "geo_name": [row[i["NAME"]] for row in rows],
@@ -179,8 +272,9 @@ def extract_counties(year: int, survey: str) -> pl.DataFrame:
             "population": [int(row[i[VAR]]) for row in rows],
             "source": [survey.upper()] * len(rows),
         }))
-        # be polite; avoid hammering the API
-        sleep(0.1)
+
+        sleep(0.1)  # be polite to the API
+
     return pl.concat(frames) if frames else _EMPTY
 
 _EMPTY = pl.DataFrame(schema={
@@ -259,85 +353,113 @@ def validate(df: pl.DataFrame) -> dict:
 
 def load(df_core: pl.DataFrame, df_alliv: pl.DataFrame, batch: str):
     with engine.begin() as conn:
-        # upsert geographies (names/types)
+        # -------- geographies
         geos = df_core.select(["geo_code", "geo_name", "geo_type"]).unique()
-        conn.execute(text("""
-            INSERT INTO core.geography(geo_code, geo_name, geo_type)
-            VALUES (:code,:name,:type)
-            ON CONFLICT (geo_code) DO UPDATE SET geo_name=EXCLUDED.geo_name, geo_type=EXCLUDED.geo_type;
-        """), [{"code": c, "name": n, "type": t} for c, n, t in zip(geos["geo_code"], geos["geo_name"], geos["geo_type"])])
+        geo_payload = [{"code": c, "name": n, "type": t}
+                       for c, n, t in zip(geos["geo_code"], geos["geo_name"], geos["geo_type"])]
+        if geo_payload:  # ← guard
+            conn.execute(text("""
+                INSERT INTO core.geography(geo_code, geo_name, geo_type)
+                VALUES (:code,:name,:type)
+                ON CONFLICT (geo_code)
+                DO UPDATE SET geo_name=EXCLUDED.geo_name, geo_type=EXCLUDED.geo_type;
+            """), geo_payload)
 
-        # canonical population facts (one per geo/year)
-        conn.execute(text("""
-            INSERT INTO core.population_observations(geo_code, year, population)
-            VALUES (:code, :year, :pop)
-            ON CONFLICT (geo_code, year) DO UPDATE SET population = EXCLUDED.population;
-        """), [{"code": c, "year": int(y), "pop": int(p)}
-               for c, y, p in zip(df_core["geo_code"], df_core["year"], df_core["population"])])
+        # -------- population facts
+        pop_payload = [{"code": c, "year": int(y), "pop": int(p)}
+                       for c, y, p in zip(df_core["geo_code"], df_core["year"], df_core["population"])]
+        if pop_payload:  # ← guard
+            conn.execute(text("""
+                INSERT INTO core.population_observations(geo_code, year, population)
+                VALUES (:code, :year, :pop)
+                ON CONFLICT (geo_code, year)
+                DO UPDATE SET population = EXCLUDED.population;
+            """), pop_payload)
 
-        # indicator mirror keeps both sources (ACS1/ACS5) with explicit codes
-        df_iv = df_alliv.with_columns(
-            pl.when(pl.col("source") == "ACS1")
-              .then(pl.lit("ACS1_TOTAL_POP"))
-              .otherwise(pl.lit("ACS5_TOTAL_POP"))
-              .alias("indicator_code")
-        )
+        # -------- indicator mirrors (ACS1/ACS5)
+        if not df_alliv.is_empty():
+            df_iv = df_alliv.with_columns(
+                pl.when(pl.col("source") == "ACS1")
+                  .then(pl.lit("ACS1_TOTAL_POP"))
+                  .otherwise(pl.lit("ACS5_TOTAL_POP"))
+                  .alias("indicator_code")
+            )
+            iv_payload = [{"code": c, "year": int(y), "icode": ic,
+                           "val": float(v), "src": s, "batch": batch}
+                          for c, y, v, s, ic in zip(
+                              df_iv["geo_code"], df_iv["year"], df_iv["population"],
+                              df_iv["source"], df_iv["indicator_code"]
+                          )]
+            if iv_payload:  # ← guard
+                conn.execute(text("""
+                    INSERT INTO core.indicator_values
+                        (geo_code, year, indicator_code, value, source, unit, etl_batch_id)
+                    VALUES
+                        (:code, :year, :icode, :val, :src, 'count', :batch)
+                    ON CONFLICT (geo_code, year, indicator_code)
+                    DO UPDATE SET value = EXCLUDED.value,
+                                  etl_batch_id = EXCLUDED.etl_batch_id;
+                """), iv_payload)
 
-        conn.execute(text("""
-            INSERT INTO core.indicator_values(geo_code, year, indicator_code, value, source, unit, etl_batch_id)
-            VALUES (:code, :year, :icode, :val, :src, 'count', :batch)
-            ON CONFLICT (geo_code, year, indicator_code)
-            DO UPDATE SET value = EXCLUDED.value, etl_batch_id = EXCLUDED.etl_batch_id;
-        """), [{"code": c, "year": int(y), "icode": ic, "val": float(v), "src": s, "batch": batch}
-               for c, y, v, s, ic in zip(df_iv["geo_code"], df_iv["year"], df_iv["population"], df_iv["source"], df_iv["indicator_code"])])
+        # Only refresh if something changed (optional optimization)
+        if pop_payload or (not df_alliv.is_empty()):
+            conn.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY ml.feature_matrix;"))
 
-        conn.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY ml.feature_matrix;"))
+# #DEBUG HELPER FUNCTION
+# def print_yearly_summary(df: pl.DataFrame, label: str):
+#     if df.is_empty():
+#         print(f"[SUM] {label}: 0 rows")
+#         return
+#     g = (df.group_by(["year", "source"])
+#            .len()
+#            .sort(["year", "source"]))
+#     print(f"[SUM] {label} (Year | Source | Rows):")
+#     print(g)
 
-#DEBUG HELPER FUNCTION
-def print_yearly_summary(df: pl.DataFrame, label: str):
-    if df.is_empty():
-        print(f"[SUM] {label}: 0 rows")
-        return
-    g = (df.group_by(["year", "source"])
-           .len()
-           .sort(["year", "source"]))
-    print(f"[SUM] {label} (Year | Source | Rows):")
-    print(g)
+    # #DEBUG
+    # print(f"[DBG] years1={years1} ({len(years1)}), years5={years5} ({len(years5)})")
+    # print(f"[DBG] df1.height={df1.height}, df5.height={df5.height}, df_all.height={df_all.height}")
+    # print("[DBG] counts by source:")
+    # print(df_all.group_by("source").len().sort("source"))
+
 
 def main():
     batch = batch_id("acs_multi")
-    # Build year lists and extract
+    os.environ["PPP_BATCH_ID"] = batch  # ensure RAW call/row logs carry this batch id
+
     years1 = [y for y in range(ACS1_START, ACS_END + 1) if _avail(y, "acs1")]
     years5 = [y for y in range(ACS5_START, ACS_END + 1) if _avail(y, "acs5")]
 
     df1 = extract_series(years1, "acs1", include_counties=INCLUDE_ACS1_COUNTIES)
     df5 = extract_series(years5, "acs5", include_counties=True)
 
-    # union for indicator mirror; choose canonical for population facts
     df_all = pl.concat([df1, df5], how="diagonal_relaxed")
     df_core = choose_canonical(df_all)
 
     rep_core = validate(df_core)
     rep_all  = validate(df_all)
-    write_json({"core": rep_core, "all_iv": rep_all,
-                "years": {"acs1": (min(years1) if years1 else None, max(years1) if years1 else None),
-                          "acs5": (min(years5) if years5 else None, max(years5) if years5 else None)}},
-               artifacts_dir() / f"acs_multi_validation_{batch}.json")
+    write_json({
+        "core": rep_core, "all_iv": rep_all,
+        "years": {
+            "acs1": (min(years1) if years1 else None, max(years1) if years1 else None),
+            "acs5": (min(years5) if years5 else None, max(years5) if years5 else None),
+        }},
+        artifacts_dir() / f"acs_multi_validation_{batch}.json"
+    )
 
-    #DEBUG
-    print(f"[DBG] years1={years1} ({len(years1)}), years5={years5} ({len(years5)})")
-    print(f"[DBG] df1.height={df1.height}, df5.height={df5.height}, df_all.height={df_all.height}")
-    print("[DBG] counts by source:")
-    print(df_all.group_by("source").len().sort("source"))
-    # in main(), after building df1/df5/df_all:
-    print_yearly_summary(df1, "ACS1")
-    print_yearly_summary(df5, "ACS5")
-    print_yearly_summary(df_all, "ALL")
+    write_stg_frame(
+        "stg.acs_population",
+        df_all.select(["geo_code","geo_name","geo_type","year","source","population"]),
+        unique_cols=["geo_code","year","source"],
+        batch_id=batch
+    )
 
     load(df_core, df_all, batch)
+
     print(f"ACS multi-year load: core={df_core.height} rows; iv={df_all.height} rows; "
           f"geos={int(df_core['geo_code'].n_unique())}; "
-          f"years1={years1[:3]}...{years1[-3:] if years1 else []}; years5={years5[:3]}...{years5[-3:] if years5 else []}.")
+          f"years1={years1[:3]}...{years1[-3:] if years1 else []}; "
+          f"years5={years5[:3]}...{years5[-3:] if years5 else []}.")
 
 if __name__ == "__main__":
     main()

@@ -1,12 +1,12 @@
 from __future__ import annotations
-import os, json, math, requests
+import os, requests
 import polars as pl
-from typing import Iterable
 from sqlalchemy import text
 from ppp_common.orm import engine
 from ..lib.util import batch_id, artifacts_dir, write_json
 from time import sleep
 from requests.adapters import HTTPAdapter, Retry
+from ..lib.layers import write_raw_event, write_stg_frame
 
 BLS_KEY   = os.environ["BUREAU_LABOR_STATISTICS_KEY"]
 START     = int(os.getenv("BLS_START", "2009")) #year acs census starts
@@ -38,7 +38,7 @@ def state_series_id(ss: str) -> str:
 def county_series_id(ss: str, ccc: str) -> str:
     return f"LAUCN{ss}{ccc}0000000003"
 
-def _post(series_ids: list[str]) -> dict:
+def _post(series_ids: list[str]) -> tuple[dict, int]:
     if not os.getenv("BUREAU_LABOR_STATISTICS_KEY"):
         raise RuntimeError("BUREAU_LABOR_STATISTICS_KEY is not set in environment.")
     payload = {
@@ -50,10 +50,9 @@ def _post(series_ids: list[str]) -> dict:
     r = SESSION.post(API, json=payload, timeout=90)
     r.raise_for_status()
     js = r.json()
-    # BLS wraps status/messages
     if js.get("status") != "REQUEST_SUCCEEDED":
         raise RuntimeError(f"BLS error: {js.get('message') or js}")
-    return js
+    return js, r.status_code
 
 # --- get states/counties from your DB geography (preferred) ---
 def _db_states_and_counties() -> tuple[list[str], list[str]]:
@@ -105,7 +104,7 @@ def extract_series_ids() -> tuple[list[str], list[str]]:
     county_ids: list[str] = []  # skip counties in this rare fallback
     return [state_series_id(ss) for ss in states], county_ids
 
-def extract() -> pl.DataFrame:
+def extract(*, batch: str) -> pl.DataFrame:
     state_ids, county_ids = extract_series_ids()
     all_ids = state_ids + county_ids
 
@@ -114,7 +113,20 @@ def extract() -> pl.DataFrame:
     frames: list[pl.DataFrame] = []
     for i in range(0, len(all_ids), CHUNK):
         chunk = all_ids[i:i+CHUNK]
-        js = _post(chunk)
+        js, status = _post(chunk)
+
+        ### WRITE TO RAW ###
+        write_raw_event(
+            raw_table="raw.bls_calls",
+            batch_id=batch,
+            endpoint=API,
+            params={"seriesid": chunk, "startyear": START, "endyear": END},
+            payload={"seriesid": chunk, "startyear": START, "endyear": END, "registrationkey": "***"},
+            response_json=js,
+            status_code=status,
+            notes=f"LAUS chunk size={len(chunk)}"
+        )
+
         series = js.get("Results", {}).get("series", [])
         for s in series:
             sid = s["seriesID"]
@@ -141,6 +153,22 @@ def extract() -> pl.DataFrame:
                 geo_type = "county"; ss = sid[5:7]; ccc = sid[7:10]; geo_code = ss + ccc
             else:
                 continue
+
+            ### WRITE TO RAW ###
+            if obs:
+                with engine.begin() as conn:
+                    rows = [{
+                        "etl_batch_id": batch,             # ← same batch
+                        "series_id": s["seriesID"],
+                        "year": int(o["year"]),
+                        "period": o.get("period"),
+                        "value": o.get("value"),
+                    } for o in obs]
+                    conn.execute(text("""
+                        INSERT INTO raw.bls_points (etl_batch_id, series_id, year, period, value)
+                        VALUES (:etl_batch_id, :series_id, :year, :period, :value)
+                        ON CONFLICT DO NOTHING;
+                    """), rows)
 
             frames.append(pl.DataFrame({
                 "geo_code": [geo_code for _ in annual],
@@ -208,11 +236,53 @@ def load(df: pl.DataFrame, batch: str):
 
 def main():
     batch = batch_id("bls_laus")
-    df = extract()
+    os.environ["PPP_BATCH_ID"] = batch  # so helpers share it
+
+    # extract/transform (single call; keyword-only guards misuse)
+    df = extract(batch=batch)
+
+    # VALIDATE
     report = validate(df)
     write_json(report, artifacts_dir() / f"bls_laus_validation_{batch}.json")
-    load(df, batch)
+
+    # WRITE STG (typed, deduped)
+    write_stg_frame(
+        "stg.laus_unrate",
+        df.select(["geo_code","geo_type","year","unrate"]),
+        unique_cols=["geo_code","year"],
+        batch_id=batch
+    )
+
+    # LOAD CORE from STG snapshot for this batch (keeps core logic unchanged)
+    with engine.begin() as conn:
+        stg = (
+            conn.execute(text("""
+                SELECT
+                    geo_code,
+                    MIN(geo_type) AS geo_type,
+                    year,
+                    AVG(unrate)   AS unrate
+                FROM stg.laus_unrate
+                WHERE etl_batch_id = :batch
+                GROUP BY geo_code, year
+            """), {"batch": batch})
+            .mappings()
+            .all()
+        )
+
+    # RowMapping -> dict so Polars is happy
+    stg_dicts = [dict(r) for r in stg]
+
+    # Build a typed Polars frame
+    df_core = pl.from_dicts(
+        stg_dicts,
+        schema={"geo_code": pl.String, "geo_type": pl.String, "year": pl.Int64, "unrate": pl.Float64}
+    )
+
+    load(df_core, batch)
+
     print(f"BLS LAUS: {df.height} rows across {int(df['geo_code'].n_unique())} geos from {START}–{END}.")
+
 
 if __name__ == "__main__":
     main()
