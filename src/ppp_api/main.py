@@ -1,14 +1,13 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from sqlalchemy import text
-from ppp_common.db import get_engine
 from ppp_common.orm import engine
 
 app = FastAPI(title="Population Prediction API", version="0.1.0")
 
 @app.get("/health")
 def health():
-    with get_engine().connect() as conn:
+    with engine.connect() as conn:
         r = conn.execute(text("SELECT 1")).scalar()
     return {"status": "ok", "db": bool(r == 1)}
 

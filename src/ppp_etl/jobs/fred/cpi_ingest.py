@@ -18,7 +18,7 @@ def fred_get(path: str, **params):
     r.raise_for_status()
     return r.json()
 
-def extract_observations(series_id: str, start="2015-01-01"):
+def extract_observations(series_id: str, start="2009-01-01"):
     js = fred_get("series/observations", series_id=series_id, observation_start=start)
     return js["observations"]  # list of {"date": "YYYY-MM-DD", "value": "123.4" or "."}
 
@@ -44,21 +44,29 @@ def validate(df: pl.DataFrame) -> dict:
     if df.is_empty():
         issues.append("no observations")
 
-    # Drop nulls before numeric checks; Pylance-friendly guards
-    vals = df["value"].drop_nulls()
-    if len(vals) > 0 and bool((vals < 0).any()):
-        issues.append("negative CPI value")
+    if "value" in df.columns:
+        vals = df["value"].drop_nulls()
+        if (not vals.is_empty()) and bool((vals < 0).any()):
+            issues.append("negative CPI value")
 
-    y_min = df["year"].min()
-    y_max = df["year"].max()
-
-    def to_int(x) -> int:
-        return int(x) if isinstance(x, (int, float)) else 0
+    years_min: int | None = None
+    years_max: int | None = None
+    if (not df.is_empty()) and ("year" in df.columns):
+        s = df["year"].drop_nulls()
+        # If this ever comes in as Date/Datetime, extract the year first
+        if s.dtype in (pl.Date, pl.Datetime):
+            s = s.dt.year()
+        # Coerce to integer dtype, then to a plain Python list for type certainty
+        s = s.cast(pl.Int64, strict=False)
+        ys = [int(y) for y in s.to_list() if y is not None]
+        if ys:
+            years_min, years_max = min(ys), max(ys)
 
     return {
-        "row_count": df.height,
-        "year_min": to_int(y_min),
-        "year_max": to_int(y_max),
+        "source": "cpi",   # or "fred"
+        "rows": df.height,
+        "geos": None,
+        "years": {"min": years_min, "max": years_max},
         "issues": issues,
     }
 
@@ -86,7 +94,7 @@ def load(df: pl.DataFrame, indicator_code: str, batch: str):
 
 def main():
     batch = batch_id("fred")
-    obs = extract_observations(SERIES_ID, start=os.getenv("FRED_START", "2015-01-01"))
+    obs = extract_observations(SERIES_ID, start=os.getenv("FRED_START", "2009-01-01"))
     df  = transform(obs)
     report = validate(df)
     write_json(report, artifacts_dir() / f"fred_{SERIES_ID}_validation_{batch}.json")
