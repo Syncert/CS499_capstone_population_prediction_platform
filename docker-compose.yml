@@ -25,7 +25,7 @@ services:
     container_name: popapi
     env_file: .env
     environment:
-      DATABASE_URL: ${DATABASE_URL}   # e.g. postgres://user:pass@db:5432/dbname
+      DB_HOST: db
     depends_on:
       db:
         condition: service_healthy
@@ -56,7 +56,7 @@ services:
     container_name: popetl
     env_file: .env
     environment:
-      DATABASE_URL: ${DATABASE_URL}
+      DB_HOST: db
     depends_on:
       db:
         condition: service_healthy

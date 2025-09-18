@@ -1,0 +1,32 @@
+{
+  "core": {
+    "source": "acs",
+    "rows": 49371,
+    "geos": 3287,
+    "years": {
+      "min": 2005,
+      "max": 2024
+    },
+    "issues": []
+  },
+  "all_iv": {
+    "source": "acs",
+    "rows": 50113,
+    "geos": 3287,
+    "years": {
+      "min": 2005,
+      "max": 2024
+    },
+    "issues": []
+  },
+  "years": {
+    "acs1": [
+      2005,
+      2024
+    ],
+    "acs5": [
+      2009,
+      2023
+    ]
+  }
+}

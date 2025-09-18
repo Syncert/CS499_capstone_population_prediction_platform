@@ -118,8 +118,94 @@ This project will be completed over **6 weeks**, with deliverables including:
 ├── ui/           # React + Tauri front-end
 ├── db/           # Postgres schema + migrations
 ├── etl/          # ETL scripts (Python jobs, pipelines)
+├── src/          # ETL scripts (Python jobs, pipelines)
+│   └── ppp_api/    # storage of code for api
+│   └── ppp_common/ # storage of code for common-use across platform
+│   └── ppp_etl/    # storage of all etl scripts
 ├── artifacts/    # Documentation and original .ipynb file
 │   └── images/   # Exported diagrams and figures
 ├── docker-compose.yml
 └── requirements.txt
 ```
+
+---
+
+## 📦 Data Sources & Indicators
+
+### ACS — American Community Survey (Census)
+
+**What it is**  
+Annual survey from the U.S. Census Bureau, with two releases:
+
+- **ACS1 (1-year):** Timelier; available for geographies with population ≥ 65k (nation, states, large counties/places).  
+- **ACS5 (5-year):** Pooled over 5 years; covers all standard geographies (nation, states, all counties, many places).
+
+**What we load**  
+- **Total population (B01001_001E):**
+  - Indicator mirrors: `ACS1_TOTAL_POP`, `ACS5_TOTAL_POP` in `core.indicator_values`  
+    *(unit = count, source = ACS)*  
+  - Canonical facts: one population per `(geo_code, year)` in `core.population_observations`
+
+**Rule of thumb**  
+- Use **ACS1** for nation/states (more current).  
+- Use **ACS5** for counties (universal coverage).
+
+**Geography keys**  
+- Nation: `US`  
+- States: 2-digit FIPS  
+- Counties: 5-digit FIPS  
+
+**Why it matters for population prediction**  
+ACS is the foundational dataset for demographic baselines. It establishes the starting population counts by geography and provides consistency across time, making it the anchor for any model that forecasts growth, migration, or demographic change.
+
+---
+
+### BLS — Local Area Unemployment Statistics (LAUS)
+
+**What it is**  
+Labor force statistics for states and counties from the Bureau of Labor Statistics.
+
+**What we load**  
+- **Unemployment rate** (annual average, percent): `BLS_UNRATE` in `core.indicator_values`  
+  *(unit = percent, source = BLS)*
+
+**Series ID patterns**  
+- **State (seasonally adjusted, annual avg):** `LAUSTSS00000000000003`  
+  *(SS = state FIPS)*  
+- **County (not seasonally adjusted, annual avg):** `LAUCNSSCCC0000000003`  
+  *(SS = state FIPS, CCC = county FIPS)*  
+
+**Why it matters for population prediction**  
+Unemployment rates reflect economic opportunity — one of the strongest drivers of migration and regional population change. Areas with sustained low unemployment often attract new residents, while persistently high unemployment can signal out-migration or slower growth.
+
+---
+
+### FRED — CPI Shelter Index (St. Louis Fed)
+
+**What it is**  
+FRED provides economic time series from sources like BLS, BEA, and Census. We use the **CPI subindex for Shelter**.
+
+**What we load**  
+- **CPI Shelter, U.S. City Average:**  
+  - Series: `CUSR0000SAH1` (seasonally adjusted monthly, annualized for storage)  
+  - Stored as: `CPI_SHELTER` in `core.indicator_values`  
+  *(unit = index (1982–84=100), source = FRED)*  
+- **Unadjusted counterpart:** `CUUR0000SAH1`
+
+**What the CPI Shelter Index measures**  
+- **Concept:** Price of housing services consumed where people live (not a house price index).  
+- **Major components:**  
+  - Rent of primary residence (observed market rents)  
+  - Owners’ Equivalent Rent (OER) — imputed rent for owner-occupied housing  
+  - Lodging away from home (small share)  
+- **Not included:** Home purchase prices, mortgage rates, property taxes, transaction costs.  
+
+**Units & frequency**  
+- Index (1982–84=100), monthly  
+- We derive annual values (calendar-year mean)
+
+**Behavioral note**  
+Shelter lags spot market rents and home prices because leases renew gradually and OER is imputed from rents.
+
+**Why it matters for population prediction**  
+Housing costs are a key constraint on where people live. Rising shelter costs can slow population inflows or drive out-migration, while affordable housing markets often attract new residents. Including Shelter CPI adds an economic dimension to population forecasting beyond raw headcounts.

@@ -10,3 +10,7 @@ __pycache__/
 # Ignore Python bytecode
 __pycache__/
 *.pyc
+
+# ignore validation outputs
+artifacts/validation/*
+!artifacts/validation/.gitkeep

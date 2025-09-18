@@ -1,0 +1,10 @@
+{
+  "source": "bls",
+  "rows": 51520,
+  "geos": 3222,
+  "years": {
+    "min": 2009,
+    "max": 2024
+  },
+  "issues": []
+}

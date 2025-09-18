@@ -8,9 +8,9 @@ COPY src /app/src
 COPY pyproject.toml README.md /app/
 COPY src /app/src
 
-
-# install ETL extras (base + etl deps)
-RUN pip install --no-cache-dir -e ".[etl]"
+# Install your package; this creates console scripts like ppp-etl-acs-pop
+RUN python -m pip install --upgrade pip && \
+    pip install -e ".[etl]"
 
 # run a module as the container's command
 CMD ["python", "-m", "ppp_etl.jobs.sample_census_ingest"]
