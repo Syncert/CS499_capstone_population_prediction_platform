@@ -12,5 +12,8 @@ COPY src /app/src
 RUN python -m pip install --upgrade pip && \
     pip install -e ".[etl]"
 
-# run a module as the container's command
-CMD ["python", "-m", "ppp_etl.jobs.sample_census_ingest"]
+# Simple entrypoint that chains the ETLs
+COPY docker/etl_entrypoint.sh /usr/local/bin/etl_entrypoint.sh
+RUN chmod +x /usr/local/bin/etl_entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/etl_entrypoint.sh"]

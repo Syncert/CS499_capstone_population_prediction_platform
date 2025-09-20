@@ -67,30 +67,77 @@ create table if not exists core.indicator_catalog (
 );
 
 -- ─────────────────────────────────────────────────────────
--- Modeling matrix
--- Use a MATERIALIZED VIEW so you can refresh after ETL.
--- Add/remove indicators here without touching storage tables.
+-- Modeling matrix (population features + best-available CPI + BLS UNRATE)
 -- ─────────────────────────────────────────────────────────
-create materialized view if not exists ml.feature_matrix as
-select
+DROP MATERIALIZED VIEW IF EXISTS ml.feature_matrix;
+
+CREATE MATERIALIZED VIEW ml.feature_matrix AS
+WITH p AS (
+  SELECT
+    geo_code,
+    year,
+    population::numeric AS population,
+    LAG(population,1) OVER (PARTITION BY geo_code ORDER BY year) AS pop_lag1,
+    LAG(population,5) OVER (PARTITION BY geo_code ORDER BY year) AS pop_lag5,
+    AVG(population)  OVER (PARTITION BY geo_code ORDER BY year
+                           ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS pop_ma3
+  FROM core.population_observations
+),
+u AS (  -- BLS unemployment
+  SELECT geo_code, year, value::numeric AS unemployment_rate
+  FROM core.indicator_values
+  WHERE indicator_code = 'BLS_UNRATE'
+),
+cg AS ( -- CPI Shelter at exact geo (currently US-only unless you load more)
+  SELECT geo_code, year, value::numeric AS cpi_geo
+  FROM core.indicator_values
+  WHERE indicator_code = 'CPI_SHELTER'
+),
+cs AS ( -- state CPI for states + counties (county inherits its state)
+  SELECT
+    p.geo_code AS county_code,
+    p.year     AS yr,
+    s.value::numeric AS cpi_state
+  FROM p
+  JOIN core.indicator_values s
+    ON s.indicator_code = 'CPI_SHELTER'
+   AND s.geo_code = CASE
+                      WHEN length(p.geo_code)=5 THEN substr(p.geo_code,1,2) -- county → state
+                      WHEN length(p.geo_code)=2 THEN p.geo_code             -- state
+                      ELSE 'ZZ'
+                    END
+   AND s.year = p.year
+  WHERE length(p.geo_code) IN (2,5)
+),
+cu AS ( -- national fallback
+  SELECT year AS yr, value::numeric AS cpi_us
+  FROM core.indicator_values
+  WHERE indicator_code = 'CPI_SHELTER' AND geo_code = 'US'
+)
+SELECT
   p.geo_code,
   p.year,
-  max(case when i.indicator_code = 'BLS_UNRATE'           then i.value end) as unemployment_rate,
-  max(case when i.indicator_code = 'BLS_LFPR'             then i.value end) as labor_force_participation,
-  max(case when i.indicator_code = 'CENSUS_BPS_PERMITS'   then i.value end) as building_permits_total,
-  max(case when i.indicator_code = 'ACS_MED_HH_INC'       then i.value end) as median_household_income,
-  max(case when i.indicator_code = 'CPI_SHELTER'          then i.value end) as rent_cpi_index,
-  max(case when i.indicator_code = 'BLS_JOLTS_OPENINGS'   then i.value end) as job_openings_rate
-from core.population_observations p
-left join core.indicator_values i
-  on i.geo_code = p.geo_code and i.year = p.year
-group by 1,2;
+  p.population,
+  p.pop_lag1,
+  p.pop_lag5,
+  p.pop_ma3,
+  CASE WHEN p.pop_lag1 IS NOT NULL AND p.pop_lag1 <> 0
+       THEN 100.0 * (p.population - p.pop_lag1) / p.pop_lag1 END AS pop_yoy_growth_pct,
+  CASE WHEN p.pop_lag5 IS NOT NULL AND p.pop_lag5 <> 0
+       THEN 100.0 * (POWER(p.population / p.pop_lag5, 1.0/5) - 1.0) END AS pop_cagr_5yr_pct,
+  u.unemployment_rate,
+  COALESCE(cg.cpi_geo, cs.cpi_state, cu.cpi_us) AS rent_cpi_index
+FROM p
+LEFT JOIN u  ON u.geo_code = p.geo_code AND u.year = p.year
+LEFT JOIN cg ON cg.geo_code = p.geo_code AND cg.year = p.year
+LEFT JOIN cs ON cs.county_code = p.geo_code AND cs.yr = p.year
+LEFT JOIN cu ON cu.yr = p.year;
 
--- Helpful indexes on the MV (Postgres 12+ supports this)
-create index if not exists ix_fm_year on ml.feature_matrix(year);
-create index if not exists ix_fm_geo  on ml.feature_matrix(geo_code);
+-- Helpful indexes on the MV
+CREATE INDEX IF NOT EXISTS ix_fm_year ON ml.feature_matrix(year);
+CREATE INDEX IF NOT EXISTS ix_fm_geo  ON ml.feature_matrix(geo_code);
 
--- required for REFRESH MATERIALIZED VIEW CONCURRENTLY
+-- Required for REFRESH MATERIALIZED VIEW CONCURRENTLY
 CREATE UNIQUE INDEX IF NOT EXISTS uq_fm_geo_year
   ON ml.feature_matrix(geo_code, year);
 
