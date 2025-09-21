@@ -30,6 +30,14 @@ etl = [
         "polars==1.6.0"
 ]
 
+ml = [
+  "scikit-learn>=1.4",
+  "prophet>=1.1",
+  "xgboost>=2.0",
+  "matplotlib>=3.8",
+  "numpy>=1.26"
+]
+
 dev = ["pytest", "ruff", "black", "mypy"]
 
 [project.scripts]
@@ -39,4 +47,4 @@ ppp-etl-bls-laus = "ppp_etl.jobs.bls.laus_unrate_ingest:main"
 ppp-etl-fred-cpi = "ppp_etl.jobs.fred.cpi_ingest:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/ppp_common", "src/ppp_api", "src/ppp_etl"]
+packages = ["src/ppp_common", "src/ppp_api", "src/ppp_etl", "src/ppp_ml"]

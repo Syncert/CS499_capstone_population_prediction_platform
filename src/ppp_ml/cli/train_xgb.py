@@ -7,7 +7,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 from ppp_ml.db import load_feature_matrix, split_train_test_years
 from ppp_ml.features import BASE_FEATURES, TARGET_COL
-from ppp_ml.linear_regression import train_linear_on_df
+from ppp_ml.xgb_forecast import train_xgb_on_df
 from ppp_ml.utils import artifact_dir, append_metrics_row
 
 
@@ -21,9 +21,9 @@ def main() -> None:
     train, test = split_train_test_years(df, args.split_year)
 
     art_dir = artifact_dir()
-    art = art_dir / "linear_model.pkl"
+    art = art_dir / "xgb_model.pkl"
 
-    res = train_linear_on_df(
+    res = train_xgb_on_df(
         train if not train.empty else df,
         BASE_FEATURES,
         TARGET_COL,
@@ -31,7 +31,7 @@ def main() -> None:
     )
 
     metrics = {
-        "model": "linear",
+        "model": "xgb",
         "mae": res.mae,
         "mse": res.rmse ** 2,
         "rmse": res.rmse,
@@ -44,7 +44,6 @@ def main() -> None:
         model = blob["model"]
         feats: list[str] = list(blob["features"])
 
-        # Be explicit for the type-checker:
         Xt_df = test.loc[:, feats].astype("float64").dropna()
         yt_df = test.loc[Xt_df.index, TARGET_COL].astype("float64")
 
@@ -56,7 +55,7 @@ def main() -> None:
         mae = float(mean_absolute_error(yt, yp))
         rmse = float(mean_squared_error(yt, yp) ** 0.5)
         metrics = {
-            "model": "linear",
+            "model": "xgb",
             "mae": mae,
             "mse": rmse**2,
             "rmse": rmse,

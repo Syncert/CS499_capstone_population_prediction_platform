@@ -1,28 +1,25 @@
 from __future__ import annotations
 from typing import Tuple
 import pandas as pd
-import sqlalchemy as sa
 from sqlalchemy import text
+import sqlalchemy as sa
 
-# Your shared engine (already configured to build the DB URL properly)
+# single source of engine
 from ppp_common.orm import engine  # type: ignore
 
 def get_engine() -> sa.Engine:
     return engine
 
-def load_population_timeseries(geo_code: str = "US") -> pd.DataFrame:
-    """
-    Returns columns: ['geo_code','year','population'] from core.population_observations.
-    """
+def load_feature_matrix(geo_code: str = "US") -> pd.DataFrame:
+    """Fetch rows from ml.feature_matrix for one geo ordered by year."""
     q = text("""
-        SELECT geo_code, year, population
-        FROM core.population_observations
+        SELECT *
+        FROM ml.feature_matrix
         WHERE geo_code = :g
         ORDER BY year
     """)
     with get_engine().connect() as cx:
-        df = pd.read_sql(q, cx, params={"g": geo_code})
-    return df
+        return pd.read_sql(q, cx, params={"g": geo_code})
 
 def split_train_test_years(df: pd.DataFrame, split_year: int = 2020) -> Tuple[pd.DataFrame, pd.DataFrame]:
     train = df[df["year"] < split_year].copy()

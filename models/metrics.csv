@@ -1,0 +1,4 @@
+model,mae,mse,rmse,notes
+linear,350826.5119426012,171675952028.17987,414337.96836420853,"test; feats=['pop_lag1', 'pop_lag5', 'pop_ma3', 'pop_yoy_growth_pct', 'pop_cagr_5yr_pct', 'rent_cpi_index']"
+ridge,2318558.7647340656,7633860670843.188,2762944.2033532253,"test; feats=['pop_lag1', 'pop_lag5', 'pop_ma3', 'pop_yoy_growth_pct', 'pop_cagr_5yr_pct', 'rent_cpi_index']"
+xgb,5965375.4,46918219052549.01,6849687.514956358,"test; feats=['pop_lag1', 'pop_lag5', 'pop_ma3', 'pop_yoy_growth_pct', 'pop_cagr_5yr_pct', 'rent_cpi_index']"
