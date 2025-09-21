@@ -67,7 +67,7 @@ create table if not exists core.indicator_catalog (
 );
 
 -- ─────────────────────────────────────────────────────────
--- Modeling matrix (population features + best-available CPI + BLS UNRATE)
+-- Modeling matrix (population + BLS UNRATE + CPI Shelter w/ state→region→US fallback)
 -- ─────────────────────────────────────────────────────────
 DROP MATERIALIZED VIEW IF EXISTS ml.feature_matrix;
 
@@ -88,26 +88,32 @@ u AS (  -- BLS unemployment
   FROM core.indicator_values
   WHERE indicator_code = 'BLS_UNRATE'
 ),
-cg AS ( -- CPI Shelter at exact geo (currently US-only unless you load more)
+cg AS ( -- CPI Shelter at exact geo (e.g., 'US'; metros would match here if loaded)
   SELECT geo_code, year, value::numeric AS cpi_geo
   FROM core.indicator_values
   WHERE indicator_code = 'CPI_SHELTER'
 ),
-cs AS ( -- state CPI for states + counties (county inherits its state)
+cs AS ( -- CPI fallback for states & counties via Census regions (R1–R4)
   SELECT
-    p.geo_code AS county_code,
+    p.geo_code AS geo_code,
     p.year     AS yr,
-    s.value::numeric AS cpi_state
+    r.value::numeric AS cpi_state_or_region
   FROM p
-  JOIN core.indicator_values s
-    ON s.indicator_code = 'CPI_SHELTER'
-   AND s.geo_code = CASE
-                      WHEN length(p.geo_code)=5 THEN substr(p.geo_code,1,2) -- county → state
-                      WHEN length(p.geo_code)=2 THEN p.geo_code             -- state
-                      ELSE 'ZZ'
-                    END
-   AND s.year = p.year
-  WHERE length(p.geo_code) IN (2,5)
+  LEFT JOIN core.indicator_values r
+    ON r.indicator_code = 'CPI_SHELTER'
+   AND r.geo_code = CASE
+         -- Northeast
+         WHEN substr(p.geo_code,1,2) IN ('09','23','25','33','44','50','34','36','42') THEN 'R1'
+         -- Midwest
+         WHEN substr(p.geo_code,1,2) IN ('17','18','26','39','55','19','20','27','29','31','38','46') THEN 'R2'
+         -- South (incl. DC=11)
+         WHEN substr(p.geo_code,1,2) IN ('01','05','10','11','12','13','21','22','24','28','37','40','45','47','48','51','54') THEN 'R3'
+         -- West
+         WHEN substr(p.geo_code,1,2) IN ('02','04','06','08','15','16','30','32','35','41','49','53','56') THEN 'R4'
+         ELSE NULL
+       END
+   AND r.year = p.year
+  WHERE (p.geo_code ~ '^\d{2}$' OR p.geo_code ~ '^\d{5}$') -- only states/counties
 ),
 cu AS ( -- national fallback
   SELECT year AS yr, value::numeric AS cpi_us
@@ -126,11 +132,11 @@ SELECT
   CASE WHEN p.pop_lag5 IS NOT NULL AND p.pop_lag5 <> 0
        THEN 100.0 * (POWER(p.population / p.pop_lag5, 1.0/5) - 1.0) END AS pop_cagr_5yr_pct,
   u.unemployment_rate,
-  COALESCE(cg.cpi_geo, cs.cpi_state, cu.cpi_us) AS rent_cpi_index
+  COALESCE(cg.cpi_geo, cs.cpi_state_or_region, cu.cpi_us) AS rent_cpi_index
 FROM p
 LEFT JOIN u  ON u.geo_code = p.geo_code AND u.year = p.year
 LEFT JOIN cg ON cg.geo_code = p.geo_code AND cg.year = p.year
-LEFT JOIN cs ON cs.county_code = p.geo_code AND cs.yr = p.year
+LEFT JOIN cs ON cs.geo_code = p.geo_code AND cs.yr = p.year
 LEFT JOIN cu ON cu.yr = p.year;
 
 -- Helpful indexes on the MV
