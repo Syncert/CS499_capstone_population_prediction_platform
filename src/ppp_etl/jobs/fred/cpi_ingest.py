@@ -7,11 +7,11 @@ from ..lib.layers import write_raw_event, write_stg_frame
 
 FRED_KEY = os.environ["FRED_KEY"]
 FRED_BASE = "https://api.stlouisfed.org/fred"
-
-# Pick one series id:
-#   CPIAUCSL  -> CPI All Urban Consumers, seasonally adjusted (index 1982-84=100)
-#   CUSR0000SEHC -> CPI Shelter
-SERIES_ID = os.getenv("FRED_SERIES_ID", "CUSR0000SEHC")
+# CPI Shelter: US + regions (NSA monthly, 1982-84=100)
+SERIES_IDS = os.getenv(
+    "FRED_SERIES_IDS",
+    "CUUR0000SAH1,CUUR0100SAH1,CUUR0200SAH1,CUUR0300SAH1,CUUR0400SAH1"
+).split(",")
 
 def fred_get(path: str, **params):
     p = {"api_key": FRED_KEY, "file_type": "json", **params}
@@ -135,26 +135,49 @@ def load(df: pl.DataFrame, indicator_code: str, batch: str):
         # Keep MV fresh
         conn.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY ml.feature_matrix;"))
 
+def load_to_geo(df: pl.DataFrame, *, geo_code: str, indicator_code: str, batch: str, geo_name: str | None = None):
+    """Generic loader for CPI to any geo_code (US or R1..R4)."""
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO core.geography(geo_code, geo_name, geo_type)
+            VALUES (:g, :n, :t)
+            ON CONFLICT (geo_code) DO NOTHING;
+        """), [{"g": geo_code, "n": (geo_name or geo_code),
+                "t": ("region" if geo_code.startswith("R") else "nation")}])
+        conn.execute(text("""
+            INSERT INTO core.indicator_values
+                (geo_code, year, indicator_code, value, source, unit, etl_batch_id)
+            VALUES
+                (:g, :year, :code, :val, 'FRED', 'index', :batch)
+            ON CONFLICT (geo_code, year, indicator_code)
+            DO UPDATE SET value = EXCLUDED.value, etl_batch_id = EXCLUDED.etl_batch_id;
+        """), [{"g": geo_code, "year": int(y), "code": indicator_code,
+                "val": float(v), "batch": batch} for y, v in zip(df["year"], df["value"])])
+
 def main():
     batch = batch_id("fred")
-    obs = extract_observations(SERIES_ID, start=os.getenv("FRED_START", "2009-01-01"), batch=batch)
-    df  = transform(obs)
-
-    # VALIDATE
-    report = validate(df)
-    write_json(report, artifacts_dir() / f"fred_{SERIES_ID}_validation_{batch}.json")
-
-    # STG
-    df_stg = df.with_columns([
-        pl.lit(SERIES_ID).alias("series_id")
-    ]).select(["year","value","series_id"])
-    write_stg_frame("stg.cpi_yearly", df_stg, unique_cols=["series_id","year"], batch_id=batch)
-
-    # CORE
-    code = "CPI_SHELTER" if SERIES_ID == "CUSR0000SEHC" else "CPI_ALL_U"
-    load(df, code, batch)
-
-    print(f"FRED {SERIES_ID}: {df.height} rows; loaded into core.indicator_values as {code}.")
+    start = os.getenv("FRED_START", "2009-01-01")
+    total = 0
+    for sid in SERIES_IDS:
+        obs = extract_observations(sid, start=start, batch=batch)
+        df  = transform(obs)
+        write_json(validate(df), artifacts_dir() / f"fred_{sid}_validation_{batch}.json")
+        # stage
+        df_stg = df.with_columns([pl.lit(sid).alias("series_id")]).select(["year","value","series_id"])
+        write_stg_frame("stg.cpi_yearly", df_stg, unique_cols=["series_id","year"], batch_id=batch)
+        # map to geo codes
+        if sid == "CUSR0000SEHC":
+            load_to_geo(df, geo_code="US", indicator_code="CPI_SHELTER", batch=batch, geo_name="United States")
+        elif sid == "CUSR0100SEHC":
+            load_to_geo(df, geo_code="R1", indicator_code="CPI_SHELTER", batch=batch, geo_name="Northeast")
+        elif sid == "CUSR0200SEHC":
+            load_to_geo(df, geo_code="R2", indicator_code="CPI_SHELTER", batch=batch, geo_name="Midwest")
+        elif sid == "CUSR0300SEHC":
+            load_to_geo(df, geo_code="R3", indicator_code="CPI_SHELTER", batch=batch, geo_name="South")
+        elif sid == "CUSR0400SEHC":
+            load_to_geo(df, geo_code="R4", indicator_code="CPI_SHELTER", batch=batch, geo_name="West")
+        total += df.height
+    print(f"FRED CPI Shelter: loaded {total} rows across US + 4 regions.")
 
 if __name__ == "__main__":
     main()
