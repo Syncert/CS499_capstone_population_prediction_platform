@@ -16,6 +16,8 @@ fi
 if [[ "$RUN_LAUS" == "1" ]]; then
   echo "[ETL] BLS LAUS ingest…"
   ppp-etl-bls-laus
+  echo "[ETL] BLS LAUS US ingest..."
+  ppp-etl-bls-unrate-us
 fi
 
 if [[ "$RUN_FRED" == "1" ]]; then
