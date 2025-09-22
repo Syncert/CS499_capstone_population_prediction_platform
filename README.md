@@ -130,82 +130,158 @@ This project will be completed over **6 weeks**, with deliverables including:
 
 ---
 
-## 📦 Data Sources & Indicators
+# 📦 Data Sources & Indicators
 
-### ACS — American Community Survey (Census)
+## ACS — American Community Survey (Census)
 
 **What it is**  
 Annual survey from the U.S. Census Bureau, with two releases:
 
-- **ACS1 (1-year):** Timelier; available for geographies with population ≥ 65k (nation, states, large counties/places).  
+- **ACS1 (1-year):** Timelier; available for geographies with population ≥ 65k (nation, states, large counties/places).
 - **ACS5 (5-year):** Pooled over 5 years; covers all standard geographies (nation, states, all counties, many places).
 
-**What we load**  
-- **Total population (B01001_001E):**
-  - Indicator mirrors: `ACS1_TOTAL_POP`, `ACS5_TOTAL_POP` in `core.indicator_values`  
-    *(unit = count, source = ACS)*  
+**What we load**
+
+- **Total population (`B01001_001E`):**
+  - Indicator mirrors: `ACS1_TOTAL_POP`, `ACS5_TOTAL_POP` in `core.indicator_values` *(unit: count, source: ACS)*  
   - Canonical facts: one population per `(geo_code, year)` in `core.population_observations`
 
-**Rule of thumb**  
-- Use **ACS1** for nation/states (more current).  
+**Rule of thumb**
+
+- Use **ACS1** for nation/states (more current).
 - Use **ACS5** for counties (universal coverage).
 
-**Geography keys**  
-- Nation: `US`  
-- States: 2-digit FIPS  
-- Counties: 5-digit FIPS  
+**Geography keys**
 
-**Why it matters for population prediction**  
-ACS is the foundational dataset for demographic baselines. It establishes the starting population counts by geography and provides consistency across time, making it the anchor for any model that forecasts growth, migration, or demographic change.
+- Nation: `US`
+- States: 2-digit FIPS
+- Counties: 5-digit FIPS
+
+**Why it matters**  
+ACS establishes the baseline population by geography and time, anchoring the forecasting models.
 
 ---
 
-### BLS — Local Area Unemployment Statistics (LAUS)
+## BLS — Local Area Unemployment Statistics (LAUS) (States & Counties)
 
 **What it is**  
 Labor force statistics for states and counties from the Bureau of Labor Statistics.
 
-**What we load**  
-- **Unemployment rate** (annual average, percent): `BLS_UNRATE` in `core.indicator_values`  
-  *(unit = percent, source = BLS)*
+**What we load**
 
-**Series ID patterns**  
-- **State (seasonally adjusted, annual avg):** `LAUSTSS00000000000003`  
-  *(SS = state FIPS)*  
-- **County (not seasonally adjusted, annual avg):** `LAUCNSSCCC0000000003`  
-  *(SS = state FIPS, CCC = county FIPS)*  
+- **Unemployment rate (annual average, percent):** `BLS_UNRATE` in `core.indicator_values` *(unit: percent, source: BLS)*
 
-**Why it matters for population prediction**  
-Unemployment rates reflect economic opportunity — one of the strongest drivers of migration and regional population change. Areas with sustained low unemployment often attract new residents, while persistently high unemployment can signal out-migration or slower growth.
+**Series ID patterns & examples**
+
+- **State (seasonally adjusted, annual avg):** `LASST{SS}…003`  
+  Example (CA): `LASST060000000000003`
+- **County (not seasonally adjusted, annual avg):** `LAUCN{SS}{CCC}…0003`  
+  Example (Los Angeles County, CA): `LAUCN060370000000003`
+
+> Notes  
+> • Annual values prefer BLS’s **M13** (annual average) observations; if absent, we compute the calendar-year mean of monthly points.  
+> • Coverage begins in **2009** to align with ACS availability used elsewhere.
+
+**Why it matters**  
+Unemployment reflects economic opportunity, a key driver of migration and regional population change.
 
 ---
 
-### FRED — CPI Shelter Index (St. Louis Fed)
+## BLS — CPS Headline Unemployment (Nation)
 
 **What it is**  
-FRED provides economic time series from sources like BLS, BEA, and Census. We use the **CPI subindex for Shelter**.
+The national unemployment rate from the Current Population Survey (CPS), via the BLS API.
 
-**What we load**  
-- **CPI Shelter, U.S. City Average:**  
-  - Series: `CUSR0000SAH1` (seasonally adjusted monthly, annualized for storage)  
-  - Stored as: `CPI_SHELTER` in `core.indicator_values`  
-  *(unit = index (1982–84=100), source = FRED)*  
-- **Unadjusted counterpart:** `CUUR0000SAH1`
+**What we load**
 
-**What the CPI Shelter Index measures**  
-- **Concept:** Price of housing services consumed where people live (not a house price index).  
-- **Major components:**  
-  - Rent of primary residence (observed market rents)  
-  - Owners’ Equivalent Rent (OER) — imputed rent for owner-occupied housing  
-  - Lodging away from home (small share)  
-- **Not included:** Home purchase prices, mortgage rates, property taxes, transaction costs.  
+- **Unemployment rate (U.S.)** (seasonally adjusted, annualized): `BLS_UNRATE` with `geo_code='US'`  
+  Series: `LNS14000000` (SA monthly → calendar-year mean) *(unit: percent, source: BLS)*
 
-**Units & frequency**  
-- Index (1982–84=100), monthly  
-- We derive annual values (calendar-year mean)
+**Why it matters**  
+Provides national coverage to complement LAUS state/county series, ensuring all three levels (US/state/county) are populated for modeling.
 
-**Behavioral note**  
-Shelter lags spot market rents and home prices because leases renew gradually and OER is imputed from rents.
+---
 
-**Why it matters for population prediction**  
-Housing costs are a key constraint on where people live. Rising shelter costs can slow population inflows or drive out-migration, while affordable housing markets often attract new residents. Including Shelter CPI adds an economic dimension to population forecasting beyond raw headcounts.
+## FRED — CPI Shelter Index (U.S. + Census Regions)
+
+**What it is**  
+CPI sub-index for **Shelter**, sourced from BLS and distributed via FRED. We load **U.S.** and the **four Census regions**, then annualize.
+
+**What we load**
+
+- **Shelter CPI (NSA monthly → annual mean):** stored as `CPI_SHELTER` in `core.indicator_values` *(unit: index (1982–84=100), source: FRED)*
+  - **U.S.:** `CUUR0000SAH1` → `geo_code='US'`
+  - **Northeast:** `CUUR0100SAH1` → `geo_code='R1'`
+  - **Midwest:** `CUUR0200SAH1` → `geo_code='R2'`
+  - **South:** `CUUR0300SAH1` → `geo_code='R3'`
+  - **West:** `CUUR0400SAH1` → `geo_code='R4'`
+
+> Notes  
+> • We use **NSA** (`CUUR…`) series and compute calendar-year means. If you prefer seasonally adjusted inputs, swap to `CUSR…` equivalents.  
+> • `core.geography` includes a `region` type for `R1–R4`.
+
+**What Shelter CPI measures**
+
+- **Concept:** Price of housing services consumed where people live (not a house price index).
+- **Components:** Rent of primary residence, Owners’ Equivalent Rent (OER), lodging away from home (small share).
+- **Not included:** Home purchase prices, mortgage rates, property taxes, transaction costs.
+- **Behavior:** Lags spot market rents due to lease renewals and OER methodology.
+
+**Why it matters**  
+Housing cost pressure shapes migration and location decisions. Adding Shelter CPI introduces a cost-of-living dimension to forecasts.
+
+---
+
+# 🧮 Feature Matrix (`ml.feature_matrix`)
+
+**Purpose**  
+A unified view aligning population, labor market, and housing-cost signals per `(geo_code, year)` for modeling.
+
+**Inputs**
+
+- `core.population_observations` (canonical population)
+- `core.indicator_values`:
+  - `BLS_UNRATE` (US via CPS; states & counties via LAUS)
+  - `CPI_SHELTER` (US + regions `R1–R4` via FRED)
+
+**CPI fallback logic**
+
+1. Use CPI at the **exact geo** if present.  
+2. Else for **states & counties**, map the state FIPS → **region (R1–R4)** and use regional CPI.  
+3. Else fall back to **US** CPI.
+
+**Region mapping**
+
+- **R1 Northeast:** CT(09), ME(23), MA(25), NH(33), RI(44), VT(50), NJ(34), NY(36), PA(42)  
+- **R2 Midwest:** IL(17), IN(18), MI(26), OH(39), WI(55), IA(19), KS(20), MN(27), MO(29), NE(31), ND(38), SD(46)  
+- **R3 South (incl. DC=11):** AL(01), AR(05), DE(10), DC(11), FL(12), GA(13), KY(21), LA(22), MD(24), MS(28), NC(37), OK(40), SC(45), TN(47), TX(48), VA(51), WV(54)  
+- **R4 West:** AK(02), AZ(04), CA(06), CO(08), HI(15), ID(16), MT(30), NV(32), NM(35), OR(41), UT(49), WA(53), WY(56)
+
+**Columns (selected)**
+
+- `population` (level value), `pop_lag1`, `pop_lag5`, `pop_ma3` (3-yr moving avg)  
+- `pop_yoy_growth_pct` (YoY % growth when `year-1` exists)  
+- `pop_cagr_5yr_pct` (5-yr CAGR when `year-5` exists)  
+- `unemployment_rate` (BLS)  
+- `rent_cpi_index` (CPI Shelter with geo→region→US fallback)
+
+**Geographies**
+
+- Nation: `US`  
+- Regions: `R1` (Northeast), `R2` (Midwest), `R3` (South), `R4` (West)  
+- States: 2-digit FIPS  
+- Counties: 5-digit FIPS
+
+---
+
+# 🔎 Validation Tips
+
+**Row parity & duplicates**
+```sql
+select count(*) from ml.feature_matrix;
+
+select geo_code, year, count(*) c
+from ml.feature_matrix
+group by 1,2
+having count(*) > 1;
+```
