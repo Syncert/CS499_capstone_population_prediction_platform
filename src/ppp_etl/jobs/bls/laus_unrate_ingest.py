@@ -9,7 +9,7 @@ from requests.adapters import HTTPAdapter, Retry
 from ..lib.layers import write_raw_event, write_stg_frame
 
 BLS_KEY   = os.environ["BUREAU_LABOR_STATISTICS_KEY"]
-START     = int(os.getenv("BLS_START", "2009")) #year acs census starts
+START     = int(os.getenv("BLS_START", "2005")) #year acs census starts
 END       = int(os.getenv("BLS_END", "2024"))
 
 API = "https://api.bls.gov/publicAPI/v2/timeseries/data/"
@@ -29,9 +29,9 @@ SESSION = _session()
 
 # ---- Series ID builders (LAUS)
 # State unemployment rate (seasonally adjusted, annual average). Pattern is:
-#   LAUST + SS + 00000000000003
+#   LASST + SS + 00000000000003
 def state_series_id(ss: str) -> str:
-    return f"LAUST{ss}00000000000003"
+    return f"LASST{ss}0000000000003"
 
 # County unemployment rate (not seasonally adjusted, annual average). Pattern is:
 #   LAUCN + SS + CCC + 0000000003
@@ -108,78 +108,115 @@ def extract(*, batch: str) -> pl.DataFrame:
     state_ids, county_ids = extract_series_ids()
     all_ids = state_ids + county_ids
 
-    # chunk requests (BLS limit ~50 series per call; keep it small)
+    print(f"[LAUS] building series: states={len(state_ids)}, counties={len(county_ids)}")
+    print(f"[LAUS] first 5 state IDs: {state_ids[:5]}")
+    if county_ids:
+        print(f"[LAUS] first 5 county IDs: {county_ids[:5]}")
+
     CHUNK = 50
-    frames: list[pl.DataFrame] = []
+    rows_out: list[dict] = []
+    tot_states = tot_counties = 0
+
     for i in range(0, len(all_ids), CHUNK):
         chunk = all_ids[i:i+CHUNK]
         js, status = _post(chunk)
 
-        ### WRITE TO RAW ###
         write_raw_event(
             raw_table="raw.bls_calls",
             batch_id=batch,
             endpoint=API,
             params={"seriesid": chunk, "startyear": START, "endyear": END},
             payload={"seriesid": chunk, "startyear": START, "endyear": END, "registrationkey": "***"},
-            response_json=js,
-            status_code=status,
+            response_json=js, status_code=status,
             notes=f"LAUS chunk size={len(chunk)}"
         )
 
         series = js.get("Results", {}).get("series", [])
+        if i == 0:
+            prefixes = sorted({s["seriesID"][:5] for s in series})
+            print(f"[LAUS] first chunk series prefixes: {prefixes}")
+
+        c_states  = sum(s["seriesID"].startswith("LASST") for s in series)
+        c_counties = sum(s["seriesID"].startswith("LAUCN") for s in series)
+        tot_states += c_states; tot_counties += c_counties
+        print(f"[LAUS] chunk {i//CHUNK+1}: states={c_states}, counties={c_counties}")
+
         for s in series:
             sid = s["seriesID"]
-            obs = s.get("data", [])
-            # obs contains monthly points; filter to annual averages ("M13") or compute mean by year
-            # LAUS ships annual averages with "period": "M13" (documented by BLS). Fallback: average months.
-            annual = [o for o in obs if o.get("period") == "M13"]
-            if not annual:
-                # fallback: avg months by year
-                df = pl.DataFrame(obs)
-                if df.is_empty():
-                    continue
-                df = df.with_columns([
-                    pl.col("value").cast(pl.Float64, strict=False),
-                    pl.col("year").cast(pl.Int32, strict=False)
-                ])
-                df = (df.group_by("year").agg(pl.col("value").mean().alias("value")).sort("year"))
-                annual = [{"year": str(int(y)), "value": str(float(v))} for y, v in zip(df["year"], df["value"])]
+            obs = s.get("data", []) or []
 
-            # decode geo from series id
-            if sid.startswith("LAUST"):
+            if sid.startswith("LASST"):
                 geo_type = "state"; ss = sid[5:7]; geo_code = ss
             elif sid.startswith("LAUCN"):
                 geo_type = "county"; ss = sid[5:7]; ccc = sid[7:10]; geo_code = ss + ccc
             else:
                 continue
 
-            ### WRITE TO RAW ###
+            # --- Build annual values robustly: prefer M13; fallback = mean of months ---
+            # NOTE: LAUS usually ships M13 annuals for LASST too, but this handles either case.
+            annual = [o for o in obs if o.get("period") == "M13"]
+            if not annual:
+                # monthly fallback
+                if not obs:
+                    print(f"[LAUS][WARN] no obs for {sid} → skipping")
+                    continue
+                dfm = pl.DataFrame(obs)
+                if dfm.is_empty():
+                    print(f"[LAUS][WARN] empty DF for {sid} → skipping")
+                    continue
+                # ensure types
+                dfm = dfm.with_columns([
+                    pl.col("value").cast(pl.Float64, strict=False),
+                    pl.col("year").cast(pl.Int32, strict=False)
+                ])
+                dfm = dfm.group_by("year").agg(pl.col("value").mean().alias("value")).sort("year")
+                annual = [{"year": int(y), "value": float(v)} for y, v in zip(dfm["year"], dfm["value"])]
+
+            if not annual:
+                print(f"[LAUS][WARN] annual empty after fallback for {sid} → skipping")
+                continue
+
+            # write RAW points only if present (nice audit)
             if obs:
                 with engine.begin() as conn:
-                    rows = [{
-                        "etl_batch_id": batch,             # ← same batch
-                        "series_id": s["seriesID"],
-                        "year": int(o["year"]),
-                        "period": o.get("period"),
-                        "value": o.get("value"),
-                    } for o in obs]
                     conn.execute(text("""
                         INSERT INTO raw.bls_points (etl_batch_id, series_id, year, period, value)
                         VALUES (:etl_batch_id, :series_id, :year, :period, :value)
                         ON CONFLICT DO NOTHING;
-                    """), rows)
+                    """), [{
+                        "etl_batch_id": batch,
+                        "series_id": sid,
+                        "year": int(o["year"]),
+                        "period": o.get("period"),
+                        "value": o.get("value"),
+                    } for o in obs])
 
-            frames.append(pl.DataFrame({
-                "geo_code": [geo_code for _ in annual],
-                "geo_type": [geo_type for _ in annual],
-                "year": [int(a["year"]) for a in annual],
-                "unrate": [float(a["value"]) for a in annual],
-            }))
+            # accumulate output rows
+            for a in annual:
+                rows_out.append({
+                    "geo_code": geo_code,
+                    "geo_type": geo_type,
+                    "year": int(a["year"]),
+                    "unrate": float(a["value"]),
+                })
 
-    # add nation (state average is not "nation"); BLS national series is LNU04000000 (but not LAUS).
-    # You can optionally map a national series from FRED/BLS here. For now we leave nation to FRED or add separately.
-    return pl.concat(frames) if frames else pl.DataFrame(schema={"geo_code": pl.String, "geo_type": pl.String, "year": pl.Int32, "unrate": pl.Float64})
+    print(f"[LAUS] totals across all chunks: states={tot_states}, counties={tot_counties}")
+
+    df = pl.from_dicts(
+        rows_out,
+        schema={"geo_code": pl.String, "geo_type": pl.String, "year": pl.Int64, "unrate": pl.Float64}
+    ) if rows_out else pl.DataFrame(schema={"geo_code": pl.String, "geo_type": pl.String, "year": pl.Int64, "unrate": pl.Float64})
+
+    # final visibility
+    if not df.is_empty():
+        n_states  = int(df.filter(pl.col("geo_type")=="state").height)
+        n_counties = int(df.filter(pl.col("geo_type")=="county").height)
+        print(f"[LAUS] extract result rows: total={df.height}, states={n_states}, counties={n_counties}, unique geos={int(df['geo_code'].n_unique())}")
+    else:
+        print("[LAUS][WARN] extract returned empty frame")
+
+    return df
+
 
 def validate(df: pl.DataFrame) -> dict:
     issues: list[str] = []

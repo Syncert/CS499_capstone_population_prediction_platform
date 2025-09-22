@@ -85,6 +85,17 @@ create table if not exists stg.laus_unrate (
 
 create index if not exists ix_stg_laus_year on stg.laus_unrate(year);
 
+-- CPS/BLS national unemployment rate (annual average, US only)
+create table if not exists stg.unrate_us_bls (
+  year         int primary key,
+  value        double precision,
+  etl_batch_id varchar(64) not null,
+  constraint chk_us_unrate_year check (year between 1900 and 2100),
+  constraint chk_us_unrate_bounds check (value is null or (value >= 0 and value <= 100))
+);
+
+create index if not exists ix_stg_unrate_us_year on stg.unrate_us_bls(year);
+
 -- FRED CPI (yearly aggregate per series)
 create table if not exists stg.cpi_yearly (
   series_id    varchar(32) not null,    -- e.g. 'CPIAUCSL', 'CUSR0000SEHC'

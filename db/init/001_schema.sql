@@ -67,32 +67,110 @@ create table if not exists core.indicator_catalog (
 );
 
 -- ─────────────────────────────────────────────────────────
--- Modeling matrix
--- Use a MATERIALIZED VIEW so you can refresh after ETL.
--- Add/remove indicators here without touching storage tables.
+-- Modeling matrix (population + BLS UNRATE + CPI Shelter w/ state→region→US fallback)
 -- ─────────────────────────────────────────────────────────
-create materialized view if not exists ml.feature_matrix as
-select
-  p.geo_code,
-  p.year,
-  max(case when i.indicator_code = 'BLS_UNRATE'           then i.value end) as unemployment_rate,
-  max(case when i.indicator_code = 'BLS_LFPR'             then i.value end) as labor_force_participation,
-  max(case when i.indicator_code = 'CENSUS_BPS_PERMITS'   then i.value end) as building_permits_total,
-  max(case when i.indicator_code = 'ACS_MED_HH_INC'       then i.value end) as median_household_income,
-  max(case when i.indicator_code = 'CPI_SHELTER'          then i.value end) as rent_cpi_index,
-  max(case when i.indicator_code = 'BLS_JOLTS_OPENINGS'   then i.value end) as job_openings_rate
-from core.population_observations p
-left join core.indicator_values i
-  on i.geo_code = p.geo_code and i.year = p.year
-group by 1,2;
+DROP MATERIALIZED VIEW IF EXISTS ml.feature_matrix;
 
--- Helpful indexes on the MV (Postgres 12+ supports this)
-create index if not exists ix_fm_year on ml.feature_matrix(year);
-create index if not exists ix_fm_geo  on ml.feature_matrix(geo_code);
+CREATE MATERIALIZED VIEW ml.feature_matrix AS
+WITH p AS (
+  SELECT
+    geo_code,
+    year,
+    population::numeric AS population,
+    LAG(population,1) OVER (PARTITION BY geo_code ORDER BY year) AS pop_lag1,
+    LAG(population,5) OVER (PARTITION BY geo_code ORDER BY year) AS pop_lag5,
+    AVG(population)  OVER (PARTITION BY geo_code ORDER BY year
+                           ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS pop_ma3
+  FROM core.population_observations
+),
+u AS (  -- BLS unemployment
+  SELECT geo_code, year, value::numeric AS unemployment_rate
+  FROM core.indicator_values
+  WHERE indicator_code = 'BLS_UNRATE'
+),
+cg AS ( -- CPI Shelter at exact geo (e.g., 'US'; metros would match here if loaded)
+  SELECT geo_code, year, value::numeric AS cpi_geo
+  FROM core.indicator_values
+  WHERE indicator_code = 'CPI_SHELTER'
+),
+cs AS ( -- CPI fallback for states & counties via Census regions (R1–R4)
+  SELECT
+    p.geo_code AS geo_code,
+    p.year     AS yr,
+    r.value::numeric AS cpi_state_or_region
+  FROM p
+  LEFT JOIN core.indicator_values r
+    ON r.indicator_code = 'CPI_SHELTER'
+   AND r.geo_code = CASE
+         -- Northeast
+         WHEN substr(p.geo_code,1,2) IN ('09','23','25','33','44','50','34','36','42') THEN 'R1'
+         -- Midwest
+         WHEN substr(p.geo_code,1,2) IN ('17','18','26','39','55','19','20','27','29','31','38','46') THEN 'R2'
+         -- South (incl. DC=11)
+         WHEN substr(p.geo_code,1,2) IN ('01','05','10','11','12','13','21','22','24','28','37','40','45','47','48','51','54') THEN 'R3'
+         -- West
+         WHEN substr(p.geo_code,1,2) IN ('02','04','06','08','15','16','30','32','35','41','49','53','56') THEN 'R4'
+         ELSE NULL
+       END
+   AND r.year = p.year
+  WHERE (p.geo_code ~ '^\d{2}$' OR p.geo_code ~ '^\d{5}$') -- only states/counties
+),
+cu AS ( -- national fallback
+  SELECT year AS yr, value::numeric AS cpi_us
+  FROM core.indicator_values
+  WHERE indicator_code = 'CPI_SHELTER' AND geo_code = 'US'
+),
+joined AS (
+  SELECT
+    p.geo_code,
+    p.year,
+    p.population,
+    p.pop_lag1,
+    p.pop_lag5,
+    p.pop_ma3,
+    CASE WHEN p.pop_lag1 IS NOT NULL AND p.pop_lag1 <> 0
+         THEN 100.0 * (p.population - p.pop_lag1) / p.pop_lag1 END AS pop_yoy_growth_pct,
+    CASE WHEN p.pop_lag5 IS NOT NULL AND p.pop_lag5 <> 0
+         THEN 100.0 * (POWER(p.population / p.pop_lag5, 1.0/5) - 1.0) END AS pop_cagr_5yr_pct,
+    u.unemployment_rate,
+    COALESCE(cg.cpi_geo, cs.cpi_state_or_region, cu.cpi_us) AS rent_cpi_index
+  FROM p
+  LEFT JOIN u  ON u.geo_code = p.geo_code AND u.year = p.year
+  LEFT JOIN cg ON cg.geo_code = p.geo_code AND cg.year = p.year
+  LEFT JOIN cs ON cs.geo_code = p.geo_code AND cs.yr = p.year
+  LEFT JOIN cu ON cu.yr = p.year
+),
+with_flags AS (
+  SELECT
+    j.*,
+    -- "Full features" = target + regressors + the features your models rely on
+    (j.population IS NOT NULL
+     AND j.unemployment_rate IS NOT NULL
+     AND j.rent_cpi_index   IS NOT NULL
+     AND j.pop_lag1         IS NOT NULL
+     AND j.pop_ma3          IS NOT NULL
+     AND j.pop_lag5         IS NOT NULL
+     AND j.pop_yoy_growth_pct IS NOT NULL
+     AND j.pop_cagr_5yr_pct   IS NOT NULL) AS has_full_features
+  FROM joined j
+),
+cutins AS (
+  SELECT
+    geo_code,
+    MIN(year) FILTER (WHERE has_full_features) AS first_full_year
+  FROM with_flags
+  GROUP BY geo_code
+)
+SELECT f.*
+FROM with_flags f
+JOIN cutins s USING (geo_code)
+WHERE f.has_full_features
+  AND f.year >= GREATEST(2005, s.first_full_year)  -- never before 2005, and only after full coverage begins
+ORDER BY f.geo_code, f.year;
 
--- required for REFRESH MATERIALIZED VIEW CONCURRENTLY
-CREATE UNIQUE INDEX IF NOT EXISTS uq_fm_geo_year
-  ON ml.feature_matrix(geo_code, year);
+-- Helpful indexes
+CREATE INDEX IF NOT EXISTS feature_matrix_geo_year_idx ON ml.feature_matrix (geo_code, year);
+CREATE INDEX IF NOT EXISTS feature_matrix_year_geo_idx ON ml.feature_matrix (year, geo_code);
 
 
 -- ─────────────────────────────────────────────────────────
