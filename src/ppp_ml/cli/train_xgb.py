@@ -56,10 +56,10 @@ def main() -> None:
         rmse = float(mean_squared_error(yt, yp) ** 0.5)
         metrics = {
             "model": "xgb",
-            "mae": mae,
-            "mse": rmse**2,
-            "rmse": rmse,
-            "notes": f"test; feats={feats}",
+            "mae":   res.mae,     # ← use the trainer’s level-aware metric
+            "mse":   res.rmse**2, # optional, derive if you want both
+            "rmse":  res.rmse,
+            "notes": f"delta_target=True; feats={res.feats}"
         }
 
     append_metrics_row(art_dir / "metrics.csv", metrics)
