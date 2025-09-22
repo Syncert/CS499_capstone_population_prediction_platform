@@ -31,7 +31,7 @@ def fred_get(path: str, **params):
     )
     return r.json()
 
-def extract_observations(series_id: str, start="2009-01-01", *, batch: str):
+def extract_observations(series_id: str, start="2005-01-01", *, batch: str):
     js = fred_get(
         "series/observations",
         series_id=series_id,
@@ -156,7 +156,7 @@ def load_to_geo(df: pl.DataFrame, *, geo_code: str, indicator_code: str, batch: 
 
 def main():
     batch = batch_id("fred")
-    start = os.getenv("FRED_START", "2009-01-01")
+    start = os.getenv("FRED_START", "2005-01-01")
     total = 0
     for sid in SERIES_IDS:
         obs = extract_observations(sid, start=start, batch=batch)
@@ -166,15 +166,15 @@ def main():
         df_stg = df.with_columns([pl.lit(sid).alias("series_id")]).select(["year","value","series_id"])
         write_stg_frame("stg.cpi_yearly", df_stg, unique_cols=["series_id","year"], batch_id=batch)
         # map to geo codes
-        if sid == "CUSR0000SEHC":
+        if sid == "CUUR0000SAH1":  # US shelter
             load_to_geo(df, geo_code="US", indicator_code="CPI_SHELTER", batch=batch, geo_name="United States")
-        elif sid == "CUSR0100SEHC":
+        elif sid == "CUUR0100SAH1":
             load_to_geo(df, geo_code="R1", indicator_code="CPI_SHELTER", batch=batch, geo_name="Northeast")
-        elif sid == "CUSR0200SEHC":
+        elif sid == "CUUR0200SAH1":
             load_to_geo(df, geo_code="R2", indicator_code="CPI_SHELTER", batch=batch, geo_name="Midwest")
-        elif sid == "CUSR0300SEHC":
+        elif sid == "CUUR0300SAH1":
             load_to_geo(df, geo_code="R3", indicator_code="CPI_SHELTER", batch=batch, geo_name="South")
-        elif sid == "CUSR0400SEHC":
+        elif sid == "CUUR0400SAH1":
             load_to_geo(df, geo_code="R4", indicator_code="CPI_SHELTER", batch=batch, geo_name="West")
         total += df.height
     print(f"FRED CPI Shelter: loaded {total} rows across US + 4 regions.")

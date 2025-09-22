@@ -9,7 +9,7 @@ from requests.adapters import HTTPAdapter, Retry
 from ..lib.layers import write_raw_event, write_stg_frame
 
 BLS_KEY   = os.environ["BUREAU_LABOR_STATISTICS_KEY"]
-START     = int(os.getenv("BLS_START", "2009")) #year acs census starts
+START     = int(os.getenv("BLS_START", "2005")) #year acs census starts
 END       = int(os.getenv("BLS_END", "2024"))
 
 API = "https://api.bls.gov/publicAPI/v2/timeseries/data/"

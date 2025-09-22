@@ -119,33 +119,58 @@ cu AS ( -- national fallback
   SELECT year AS yr, value::numeric AS cpi_us
   FROM core.indicator_values
   WHERE indicator_code = 'CPI_SHELTER' AND geo_code = 'US'
+),
+joined AS (
+  SELECT
+    p.geo_code,
+    p.year,
+    p.population,
+    p.pop_lag1,
+    p.pop_lag5,
+    p.pop_ma3,
+    CASE WHEN p.pop_lag1 IS NOT NULL AND p.pop_lag1 <> 0
+         THEN 100.0 * (p.population - p.pop_lag1) / p.pop_lag1 END AS pop_yoy_growth_pct,
+    CASE WHEN p.pop_lag5 IS NOT NULL AND p.pop_lag5 <> 0
+         THEN 100.0 * (POWER(p.population / p.pop_lag5, 1.0/5) - 1.0) END AS pop_cagr_5yr_pct,
+    u.unemployment_rate,
+    COALESCE(cg.cpi_geo, cs.cpi_state_or_region, cu.cpi_us) AS rent_cpi_index
+  FROM p
+  LEFT JOIN u  ON u.geo_code = p.geo_code AND u.year = p.year
+  LEFT JOIN cg ON cg.geo_code = p.geo_code AND cg.year = p.year
+  LEFT JOIN cs ON cs.geo_code = p.geo_code AND cs.yr = p.year
+  LEFT JOIN cu ON cu.yr = p.year
+),
+with_flags AS (
+  SELECT
+    j.*,
+    -- "Full features" = target + regressors + the features your models rely on
+    (j.population IS NOT NULL
+     AND j.unemployment_rate IS NOT NULL
+     AND j.rent_cpi_index   IS NOT NULL
+     AND j.pop_lag1         IS NOT NULL
+     AND j.pop_ma3          IS NOT NULL
+     AND j.pop_lag5         IS NOT NULL
+     AND j.pop_yoy_growth_pct IS NOT NULL
+     AND j.pop_cagr_5yr_pct   IS NOT NULL) AS has_full_features
+  FROM joined j
+),
+cutins AS (
+  SELECT
+    geo_code,
+    MIN(year) FILTER (WHERE has_full_features) AS first_full_year
+  FROM with_flags
+  GROUP BY geo_code
 )
-SELECT
-  p.geo_code,
-  p.year,
-  p.population,
-  p.pop_lag1,
-  p.pop_lag5,
-  p.pop_ma3,
-  CASE WHEN p.pop_lag1 IS NOT NULL AND p.pop_lag1 <> 0
-       THEN 100.0 * (p.population - p.pop_lag1) / p.pop_lag1 END AS pop_yoy_growth_pct,
-  CASE WHEN p.pop_lag5 IS NOT NULL AND p.pop_lag5 <> 0
-       THEN 100.0 * (POWER(p.population / p.pop_lag5, 1.0/5) - 1.0) END AS pop_cagr_5yr_pct,
-  u.unemployment_rate,
-  COALESCE(cg.cpi_geo, cs.cpi_state_or_region, cu.cpi_us) AS rent_cpi_index
-FROM p
-LEFT JOIN u  ON u.geo_code = p.geo_code AND u.year = p.year
-LEFT JOIN cg ON cg.geo_code = p.geo_code AND cg.year = p.year
-LEFT JOIN cs ON cs.geo_code = p.geo_code AND cs.yr = p.year
-LEFT JOIN cu ON cu.yr = p.year;
+SELECT f.*
+FROM with_flags f
+JOIN cutins s USING (geo_code)
+WHERE f.has_full_features
+  AND f.year >= GREATEST(2005, s.first_full_year)  -- never before 2005, and only after full coverage begins
+ORDER BY f.geo_code, f.year;
 
--- Helpful indexes on the MV
-CREATE INDEX IF NOT EXISTS ix_fm_year ON ml.feature_matrix(year);
-CREATE INDEX IF NOT EXISTS ix_fm_geo  ON ml.feature_matrix(geo_code);
-
--- Required for REFRESH MATERIALIZED VIEW CONCURRENTLY
-CREATE UNIQUE INDEX IF NOT EXISTS uq_fm_geo_year
-  ON ml.feature_matrix(geo_code, year);
+-- Helpful indexes
+CREATE INDEX IF NOT EXISTS feature_matrix_geo_year_idx ON ml.feature_matrix (geo_code, year);
+CREATE INDEX IF NOT EXISTS feature_matrix_year_geo_idx ON ml.feature_matrix (year, geo_code);
 
 
 -- ─────────────────────────────────────────────────────────
