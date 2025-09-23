@@ -1,6 +1,11 @@
 FROM python:3.11-slim
 WORKDIR /app
 
+# install system deps (curl + jq for testing/debug)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl jq \
+ && rm -rf /var/lib/apt/lists/*
+
 # copy dependency metadata + source
 COPY pyproject.toml README.md /app/
 COPY src /app/src
