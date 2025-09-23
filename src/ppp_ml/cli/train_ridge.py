@@ -13,15 +13,18 @@ from ppp_ml.utils import artifact_dir, append_metrics_row
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--geo", default="US")
+    ap.add_argument("--geo", required=True)
     ap.add_argument("--split_year", type=int, default=2020)
     args = ap.parse_args()
 
     df = load_feature_matrix(args.geo)
     train, test = split_train_test_years(df, args.split_year)
 
-    art_dir = artifact_dir()
-    art = art_dir / "ridge_model.pkl"
+    #define directory
+    art_dir = artifact_dir() / "ridge"
+    art_dir.mkdir(parents=True, exist_ok=True)
+
+    art = art_dir / f"ridge_{args.geo}.pkl"
 
     res = train_ridge_on_df(
         train if not train.empty else df,
@@ -31,6 +34,7 @@ def main() -> None:
     )
 
     metrics = {
+        "geo": args.geo,
         "model": "ridge",
         "mae": res.mae,
         "mse": res.rmse ** 2,
@@ -55,6 +59,7 @@ def main() -> None:
         mae = float(mean_absolute_error(yt, yp))
         rmse = float(mean_squared_error(yt, yp) ** 0.5)
         metrics = {
+            "geo": args.geo,
             "model": "ridge",
             "mae": mae,
             "mse": rmse**2,
@@ -64,7 +69,6 @@ def main() -> None:
 
     append_metrics_row(art_dir / "metrics.csv", metrics)
     print("Saved:", art, "Metrics:", metrics)
-
 
 if __name__ == "__main__":
     main()

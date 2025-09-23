@@ -13,15 +13,18 @@ from ppp_ml.utils import artifact_dir, append_metrics_row
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--geo", default="US")
+    ap.add_argument("--geo", required=True)
     ap.add_argument("--split_year", type=int, default=2020)
     args = ap.parse_args()
 
     df = load_feature_matrix(args.geo)
     train, test = split_train_test_years(df, args.split_year)
 
-    art_dir = artifact_dir()
-    art = art_dir / "xgb_model.pkl"
+    #define directory
+    art_dir = artifact_dir() / "xgb"
+    art_dir.mkdir(parents=True, exist_ok=True)
+
+    art = art_dir / f"xgb_{args.geo}.pkl"
 
     res = train_xgb_on_df(
         train if not train.empty else df,
@@ -31,6 +34,7 @@ def main() -> None:
     )
 
     metrics = {
+        "geo": args.geo,
         "model": "xgb",
         "mae": res.mae,
         "mse": res.rmse ** 2,
@@ -47,24 +51,24 @@ def main() -> None:
         Xt_df = test.loc[:, feats].astype("float64").dropna()
         yt_df = test.loc[Xt_df.index, TARGET_COL].astype("float64")
 
-        Xt: NDArray[np.float64] = Xt_df.to_numpy()
-        yt: NDArray[np.float64] = yt_df.to_numpy()
+        Xt = Xt_df.to_numpy()
+        yt = yt_df.to_numpy()
 
-        yp: NDArray[np.float64] = model.predict(Xt)  # type: ignore[no-any-return]
+        yp = model.predict(Xt)  # type: ignore[no-any-return]
 
         mae = float(mean_absolute_error(yt, yp))
         rmse = float(mean_squared_error(yt, yp) ** 0.5)
         metrics = {
+            "geo": args.geo,
             "model": "xgb",
-            "mae":   res.mae,     # ← use the trainer’s level-aware metric
-            "mse":   res.rmse**2, # optional, derive if you want both
-            "rmse":  res.rmse,
-            "notes": f"delta_target=True; feats={res.feats}"
+            "mae": mae,
+            "mse": rmse**2,
+            "rmse": rmse,
+            "notes": f"test; feats={feats}",
         }
 
     append_metrics_row(art_dir / "metrics.csv", metrics)
     print("Saved:", art, "Metrics:", metrics)
-
 
 if __name__ == "__main__":
     main()

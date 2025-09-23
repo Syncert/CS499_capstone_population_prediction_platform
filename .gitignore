@@ -14,3 +14,10 @@ __pycache__/
 # ignore validation outputs
 artifacts/validation/*
 !artifacts/validation/.gitkeep
+
+#models
+models/**/*.csv
+models/**/prophet_model_*.json
+models/**/linear_*.pkl
+models/**/ridge_*.pkl
+models/**/xgb_*.pkl

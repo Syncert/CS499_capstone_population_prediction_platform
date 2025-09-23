@@ -13,12 +13,14 @@ def artifact_dir() -> Path:
     p.mkdir(parents=True, exist_ok=True)
     return p
 
-def append_metrics_row(path: Path, row: Dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not path.exists()
-    with open(path, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["model", "mae", "mse", "rmse", "notes"])
-        if write_header:
+def append_metrics_row(path: Path, row: dict):
+    # Ensure file exists and has correct header
+    fieldnames = ["geo", "model", "mae", "mse", "rmse", "notes"]
+    file_exists = path.exists()
+
+    with path.open("a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
             w.writeheader()
         w.writerow(row)
 

@@ -27,10 +27,10 @@ API_JWT_TTL_SECONDS = int(os.getenv("API_JWT_TTL_SECONDS", "3600"))
 
 MODELS_DIR = Path(os.getenv("MODELS_DIR", "models"))
 MODEL_PATHS = {
-    "linear": MODELS_DIR / "linear_model.pkl",
-    "ridge":  MODELS_DIR / "ridge_model.pkl",
-    "xgb":    MODELS_DIR / "xgb_model.pkl",
-    "prophet": MODELS_DIR / "prophet_model.json"
+    "linear": lambda geo: MODELS_DIR / "linear" / f"{geo}.pkl",
+    "ridge":  lambda geo: MODELS_DIR / "ridge" / f"{geo}.pkl",
+    "xgb":    lambda geo: MODELS_DIR / "xgb" / f"{geo}.pkl",
+    "prophet":lambda geo: MODELS_DIR / "prophet" / f"{geo}.json",
 }
 
 IDENT_COLS = {"geo_code", "year"}  # keep these out of feature matrix
@@ -100,27 +100,40 @@ def _get_engine() -> Engine:
     return DB_ENGINE
 
 
+# in ppp_api.main
 def _load_models() -> None:
     MODEL_REGISTRY.clear()
-    for name, path in MODEL_PATHS.items():
-        if not path.exists():
-            continue
 
-        if name == "prophet":
+    # sklearn/xgb by geo
+    for family in ("linear", "ridge", "xgb"):
+        d = MODELS_DIR / family
+        if not d.exists():
+            continue
+        for p in d.glob("*.pkl"):
+            stem = p.stem  # e.g., "10" or "linear_10"
+            if "_" in stem:
+                model, geo = stem.split("_", 1)  # ("linear", "10")
+            else:
+                model, geo = family, stem        # ("linear", "10")
+            key = f"{model}_{geo}"               # "linear_10"
             try:
-                txt = path.read_text(encoding="utf-8")
-                MODEL_REGISTRY[name] = {"type": "prophet_model", "model": model_from_json(txt)}
+                MODEL_REGISTRY[key] = pickle.load(p.open("rb"))
             except Exception as e:
-                print(f"[WARN] Failed loading Prophet model {path}: {e}")
-            continue
+                print(f"[WARN] load fail {p}: {e}")
 
-        try:
-            with path.open("rb") as f:
-                obj = pickle.load(f)
-            # allow wrapped artifacts: {"model": estimator, "features": [...]}
-            MODEL_REGISTRY[name] = obj
-        except Exception as e:
-            print(f"[WARN] Failed loading model {name} ({path}): {e}")
+    # prophet by geo
+    proph_dir = MODELS_DIR / "prophet"
+    if proph_dir.exists():
+        for p in proph_dir.glob("prophet_model_*.json"):
+            geo = p.stem.split("prophet_model_")[-1]
+            try:
+                MODEL_REGISTRY[f"prophet_{geo}"] = {
+                    "type":"prophet_model",
+                    "model": model_from_json(p.read_text("utf-8"))
+                }
+            except Exception as e:
+                print(f"[WARN] load fail {p}: {e}")
+
 
 def _fetch_features_window(geo_code: str, start_year: int, end_year: int) -> pd.DataFrame:
     q = text("""
@@ -180,29 +193,27 @@ def predict(req: PredictRequest):
     years = list(range(int(req.start_year), int(req.end_year) + 1))
 
     # ----------------------------
-    # Prophet branch (no feature_matrix for X; only for regressors when needed)
+    # Prophet: per-geo model (JSON) + regressors from feature_matrix
     # ----------------------------
     if model_name == "prophet":
-        reg = MODEL_REGISTRY.get("prophet")
+        key = f"prophet_{geo}"
+        reg = MODEL_REGISTRY.get(key)
         if reg is None:
-            raise HTTPException(status_code=400, detail="Model 'prophet' is not loaded on server")
+            raise HTTPException(status_code=404, detail=f"No Prophet model for geo={geo}. Expected models/prophet/prophet_model_{geo}.json")
 
-        model = reg["model"]  # loaded via model_from_json
+        model = reg["model"]  # from model_from_json
 
-        # Find which regressors Prophet expects (if any)
+        # Prophet expects ds and any extra regressors used at fit time
         try:
             required_regs = list(getattr(model, "extra_regressors", {}).keys())
         except Exception:
             required_regs = []
 
-        # Build the future frame
         future = pd.DataFrame({"ds": pd.to_datetime([f"{y}-01-01" for y in years])})
-        future["year"] = future["ds"].dt.year  # to join with feature_matrix rows
+        future["year"] = future["ds"].dt.year
 
         if required_regs:
-            # Pull required regressors from your feature matrix (by year)
             df_feat = _fetch_features_window(geo, req.start_year, req.end_year)
-
             missing_in_feat = [c for c in required_regs if c not in df_feat.columns]
             if missing_in_feat:
                 raise HTTPException(
@@ -212,18 +223,15 @@ def predict(req: PredictRequest):
 
             grp = (df_feat.groupby("year", as_index=False)[required_regs]
                          .mean(numeric_only=True))
-
             future = future.merge(grp, on="year", how="left")
 
-            # Light imputations for stability
+            # light imputations for stability
             future[required_regs] = future[required_regs].ffill().bfill()
             for c in required_regs:
                 if future[c].isna().any():
                     future[c].fillna(float(df_feat[c].mean()), inplace=True)
 
-            future = future.drop(columns=["year"])
-        else:
-            future = future.drop(columns=["year"])
+        future = future.drop(columns=["year"])
 
         try:
             fcst = model.predict(future)
@@ -239,38 +247,36 @@ def predict(req: PredictRequest):
             raise HTTPException(status_code=400, detail=f"prophet prediction failed: {e}")
 
     # ----------------------------
-    # sklearn/xgb branch (uses feature_matrix for X)
+    # Sklearn/XGB: per-geo estimator (pickle) + feature_matrix window
     # ----------------------------
     df = _fetch_features_window(geo, req.start_year, req.end_year)
     if df.empty:
         raise HTTPException(status_code=404, detail="No feature rows found for selection")
 
     IDENT_COLS = {"geo_code", "year"}
-    TARGETish = {"population", "y", "target", "label"}
+    TARGETish  = {"population", "y", "target", "label"}
 
-    # choose numeric features, exclude ids/targets
     features = [c for c in df.columns if c not in (IDENT_COLS | TARGETish)]
     features = [c for c in features if pd.api.types.is_numeric_dtype(df[c])]
-
     if not features:
         raise HTTPException(status_code=400, detail="No numeric feature columns available")
 
-    # coerce to numeric to avoid object/Decimal from SQL
+    # coerce to numeric to avoid object/Decimal
     X_all = df[features].apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
-    m = MODEL_REGISTRY.get(model_name)
+    key = f"{model_name}_{geo}"
+    m = MODEL_REGISTRY.get(key)
     if m is None:
-        raise HTTPException(status_code=400, detail=f"Model '{model_name}' is not loaded on server")
+        raise HTTPException(status_code=404, detail=f"No {model_name} model for geo={geo}. Expected models/{model_name}/{geo}.pkl")
 
-    # unwrap dict-wrapped artifacts like {"model": estimator, "features": [...], "rename_map": {...}}
+    # unwrap dict artifacts: {"model": estimator, "features": [...], "rename_map": {...}}
     estimator = m.get("model") if isinstance(m, dict) else m
     if estimator is None or not hasattr(estimator, "predict"):
-        raise HTTPException(status_code=400, detail=f"model '{model_name}' is not a valid predictor")
+        raise HTTPException(status_code=400, detail=f"model '{model_name}' for geo={geo} is not a valid predictor")
 
     saved_feats = (m.get("features") if isinstance(m, dict) else None) \
                   or (list(getattr(estimator, "feature_names_in_", [])) or None)
 
-    # optional rename map to align live names to training names
     rename_map = m.get("rename_map") if isinstance(m, dict) else None
     if rename_map:
         X_all = X_all.rename(columns=rename_map)
@@ -281,7 +287,7 @@ def predict(req: PredictRequest):
         if missing:
             raise HTTPException(
                 status_code=400,
-                detail=f"model '{model_name}' missing required features: {missing}; extra provided: {extra}"
+                detail=f"model '{model_name}' for geo={geo} missing required features: {missing}; extra provided: {extra}"
             )
         X = X_all.reindex(columns=saved_feats)
     else:
@@ -289,18 +295,20 @@ def predict(req: PredictRequest):
 
     X = X.astype("float64")
 
+    # Some XGB wrappers behave best with numpy arrays in exact order
     try:
         yhat = estimator.predict(X)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"model '{model_name}' predict failed: {e}")
+    except Exception:
+        yhat = estimator.predict(X.to_numpy(copy=False))
 
     return PredictResponse(
         geography=geo,
         model=model_name,
         years=df["year"].astype(int).tolist(),
         forecast=[float(v) for v in yhat],
-        features_used=list(X.columns),
+        features_used=list(X.columns) if saved_feats is None else saved_feats,
     )
+
 
 
 # #DEBUG REMOVE LATER
