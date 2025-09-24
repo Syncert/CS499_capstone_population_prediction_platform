@@ -24,6 +24,9 @@ The platform forecasts U.S. population trends using multiple algorithms, provide
 
 ## 🗂️ Artifact Enhancements by Category
 
+## 📹 Code Review (Video)
+[![Watch the code review](https://img.youtube.com/vi/1Ghb1E5JotU/hqdefault.jpg)](https://youtu.be/1Ghb1E5JotU)
+
 ### 1. Software Engineering & Design
 - **Enhancement**: Build a containerized web + desktop application with interactive charts (React + Chart.js, Tauri).  
 - **Outcomes Demonstrated**:  
