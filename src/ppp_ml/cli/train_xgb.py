@@ -1,74 +1,75 @@
+# src/ppp_ml/cli/train_xgb.py
 from __future__ import annotations
 import argparse
-import pickle
-from numpy.typing import NDArray
-import numpy as np
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+import pandas as pd
+from xgboost import XGBRegressor
 
-from ppp_ml.db import load_feature_matrix, split_train_test_years
-from ppp_ml.features import BASE_FEATURES, TARGET_COL
-from ppp_ml.xgb_forecast import train_xgb_on_df
-from ppp_ml.utils import artifact_dir, append_metrics_row
+from ppp_ml.hashers import dataframe_hash
+from ppp_ml.artifacts import record_run_start, record_metrics, record_forecasts, finish_and_point_artifact, capture_env, ensure_artifact_row
+from ppp_ml.db import load_feature_matrix
+from ppp_ml.training_io import attach_actuals, basic_test_metrics, select_numeric_features
 
-
-def main() -> None:
+def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--geo", required=True)
     ap.add_argument("--split_year", type=int, default=2020)
+    ap.add_argument("--horizon", type=int, default=10)
+    ap.add_argument("--max_depth", type=int, default=4)
+    ap.add_argument("--n_estimators", type=int, default=200)
+    ap.add_argument("--learning_rate", type=float, default=0.05)
     args = ap.parse_args()
 
     df = load_feature_matrix(args.geo)
-    train, test = split_train_test_years(df, args.split_year)
+    if df.empty:
+        raise SystemExit("no rows")
 
-    #define directory
-    art_dir = artifact_dir() / "xgb"
-    art_dir.mkdir(parents=True, exist_ok=True)
+    h = dataframe_hash(df)
+    ensure_artifact_row(args.geo, "xgb", h)
+    rows = len(df)
+    y0, y1 = int(df["year"].min()), int(df["year"].max())
 
-    art = art_dir / f"xgb_{args.geo}.pkl"
+    feature_cols = select_numeric_features(df)
+    X = df[feature_cols].values
+    y = df["population"].values
+    years = df["year"].values
 
-    res = train_xgb_on_df(
-        train if not train.empty else df,
-        BASE_FEATURES,
-        TARGET_COL,
-        str(art),
+    model = XGBRegressor(
+        max_depth=args.max_depth,
+        n_estimators=args.n_estimators,
+        learning_rate=args.learning_rate,
+        subsample=0.9, colsample_bytree=0.9, random_state=42
+    )
+    model.fit(X[years <= args.split_year], y[years <= args.split_year])
+
+    back = pd.DataFrame({"year": years, "yhat": model.predict(X)})
+    if args.horizon > 0:
+        last_feats = df.iloc[-1][feature_cols].values
+        fut_years = list(range(int(y1)+1, int(y1)+1+args.horizon))
+        futX = [last_feats for _ in fut_years]
+        fut = pd.DataFrame({"year": fut_years, "yhat": model.predict(pd.DataFrame(futX, columns=feature_cols).values)})
+        pred_df = pd.concat([back, fut], ignore_index=True)
+    else:
+        pred_df = back
+
+    pred_df["ds"] = pd.to_datetime(pred_df["year"].astype(str) + "-12-31")
+    forecast_df = attach_actuals(args.geo, pred_df[["ds","yhat"]])
+
+    run_id = record_run_start(
+        geo=args.geo, model="xgb", data_hash=h,
+        rows=rows, year_min=y0, year_max=y1,
+        split_year=args.split_year, horizon=args.horizon,
+        params={
+            "features": feature_cols,
+            "max_depth": args.max_depth,
+            "n_estimators": args.n_estimators,
+            "learning_rate": args.learning_rate
+        },
+        env=capture_env()
     )
 
-    metrics = {
-        "geo": args.geo,
-        "model": "xgb",
-        "mae": res.mae,
-        "mse": res.rmse ** 2,
-        "rmse": res.rmse,
-        "notes": f"train; feats={res.feats}",
-    }
-
-    if not test.empty:
-        with open(art, "rb") as f:
-            blob = pickle.load(f)
-        model = blob["model"]
-        feats: list[str] = list(blob["features"])
-
-        Xt_df = test.loc[:, feats].astype("float64").dropna()
-        yt_df = test.loc[Xt_df.index, TARGET_COL].astype("float64")
-
-        Xt = Xt_df.to_numpy()
-        yt = yt_df.to_numpy()
-
-        yp = model.predict(Xt)  # type: ignore[no-any-return]
-
-        mae = float(mean_absolute_error(yt, yp))
-        rmse = float(mean_squared_error(yt, yp) ** 0.5)
-        metrics = {
-            "geo": args.geo,
-            "model": "xgb",
-            "mae": mae,
-            "mse": rmse**2,
-            "rmse": rmse,
-            "notes": f"test; feats={feats}",
-        }
-
-    append_metrics_row(art_dir / "metrics.csv", metrics)
-    print("Saved:", art, "Metrics:", metrics)
+    record_metrics(run_id, basic_test_metrics(forecast_df))
+    record_forecasts(run_id, args.geo, "xgb", forecast_df)
+    finish_and_point_artifact(run_id)
 
 if __name__ == "__main__":
     main()

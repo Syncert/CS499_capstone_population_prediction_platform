@@ -172,6 +172,207 @@ ORDER BY f.geo_code, f.year;
 CREATE INDEX IF NOT EXISTS feature_matrix_geo_year_idx ON ml.feature_matrix (geo_code, year);
 CREATE INDEX IF NOT EXISTS feature_matrix_year_geo_idx ON ml.feature_matrix (year, geo_code);
 
+-- ─────────────────────────────────────────────────────────
+-- object: ml.model_artifacts (TABLE)
+-- purpose:
+--   One row per (geo_code, model). Acts as the "pointer" to the latest and/or
+--   best training run. Used by drift detection and by serving layers to decide
+--   which run to read.
+-- grain:
+--   (geo_code, model) unique
+-- key columns:
+--   geo_code TEXT, model TEXT
+-- data ownership:
+--   owned by ML training pipeline
+-- write pattern:
+--   upsert after each successful training; updates pointers latest_run_id/best_run_id
+-- read pattern:
+--   API / scoring jobs read current pointers; governance dashboards read to audit freshness
+-- retention:
+--   permanent (tiny table)
+-- dependencies:
+--   references ml.model_runs via latest_run_id / best_run_id (not FK-enforced)
+-- caveats:
+--   Do not store per-run metrics here; use ml.model_runs + ml.model_metrics
+-- ─────────────────────────────────────────────────────────
+
+
+-- one row per (geo, model family) — pointer to runs
+create table if not exists ml.model_artifacts (
+  geo_code       text not null,
+  model          text not null,     -- 'prophet' | 'linear' | 'ridge' | 'xgb'
+  data_hash      text not null,
+  trained_at     timestamptz not null default now(),
+  rows           int,
+  year_min       int,
+  year_max       int,
+  artifact_path  text,
+  notes          text,
+
+  -- new: pointer(s)
+  latest_run_id  uuid,              -- last successful training
+  best_run_id    uuid,              -- best by your chosen metric (e.g., RMSE on test)
+
+  primary key (geo_code, model)
+);
+
+create extension if not exists pgcrypto; -- for gen_random_uuid()
+
+-- ─────────────────────────────────────────────────────────
+-- object: ml.model_runs (TABLE)
+-- purpose:
+--   Append-only registry of every training run; captures params, environment,
+--   data hash, split config, and artifact path.
+-- grain:
+--   one row per run (run_id UUID)
+-- key columns:
+--   run_id UUID primary key
+-- write pattern:
+--   insert at run start; optionally update duration_ms/artifact_path at finish
+-- read pattern:
+--   audit, reproducibility, leaderboard joins
+-- retention:
+--   permanent (keeps lineage)
+-- dependencies:
+--   referenced by ml.model_metrics, ml.model_forecasts
+-- indexes:
+--   (geo_code, model, trained_at desc) to speed “latest runs” queries
+-- ─────────────────────────────────────────────────────────
+
+
+create table if not exists ml.model_runs (
+  run_id        uuid primary key default gen_random_uuid(),
+  geo_code      text not null,
+  model         text not null,
+  data_hash     text not null,
+  trained_at    timestamptz not null default now(),
+  rows          int,
+  year_min      int,
+  year_max      int,
+  split_year    int,                 -- e.g., 2020 for holdout
+  horizon       int,                 -- forecast horizon used
+  train_rows    int,
+  test_rows     int,
+  duration_ms   int,
+  artifact_path text,
+  params        jsonb,               -- hyperparams, feature flags
+  env           jsonb,               -- python version, package versions, git commit
+  notes         text
+);
+
+create index if not exists ix_runs_geo_model_time
+  on ml.model_runs(geo_code, model, trained_at desc);
+
+-- ─────────────────────────────────────────────────────────
+-- object: ml.model_metrics (TABLE)
+-- purpose:
+--   Normalized metric store (rmse/mae/mape/r2, train/val/test/cv, optional folds).
+-- grain:
+--   (run_id, metric, scope, fold) unique; fold null means aggregate
+-- write pattern:
+--   bulk insert per run after evaluation
+-- read pattern:
+--   dashboards & selection logic (e.g., best_run_id)
+-- retention:
+--   permanent (tiny)
+-- dependencies:
+--   references ml.model_runs(run_id)
+-- ─────────────────────────────────────────────────────────
+
+
+create table if not exists ml.model_metrics (
+  run_id   uuid not null references ml.model_runs(run_id) on delete cascade,
+  metric   text not null,             -- 'rmse','mae','mape','r2', etc.
+  scope    text not null,             -- 'train'|'val'|'test'|'cv'
+  fold     int  not null default -1,  -- -1 = aggregate, 0..k-1 = CV folds
+  value    double precision not null,
+  primary key (run_id, metric, scope, fold)
+);
+
+
+-- ─────────────────────────────────────────────────────────
+-- object: ml.model_headline (MATERIALIZED VIEW)
+-- purpose:
+--   Convenience aggregation of “headline” metrics per run for fast ranking.
+-- refresh:
+--   REFRESH MATERIALIZED VIEW CONCURRENTLY ml.model_headline;
+-- read pattern:
+--   leaderboard, artifact pointer updates
+-- caveats:
+--   Must be refreshed after inserting metrics
+-- ─────────────────────────────────────────────────────────
+
+
+create materialized view if not exists ml.model_headline as
+  select run_id,
+         max(value) filter (where metric='r2' and scope='test') as r2_test,
+         min(value) filter (where metric='rmse' and scope='test') as rmse_test,
+         min(value) filter (where metric='mae' and scope='test')  as mae_test
+  from ml.model_metrics
+  group by run_id;
+
+create unique index if not exists ux_ml_model_headline_run
+  on ml.model_headline(run_id);
+
+-- ─────────────────────────────────────────────────────────
+-- object: ml.model_forecasts (TABLE)
+-- purpose:
+--   Snapshot of predictions per run (and optional actuals for backtests).
+-- grain:
+--   (run_id, ds) unique (yearly; or change ds to int if you prefer)
+-- write pattern:
+--   bulk insert per run after forecasting
+-- read pattern:
+--   API-serving (via best_run_id), backtesting, error analysis
+-- retention:
+--   keep; if size grows, partition by year
+-- dependencies:
+--   references ml.model_runs(run_id)
+-- indexes:
+--   (geo_code, model, ds) for explorations
+-- ─────────────────────────────────────────────────────────
+
+
+create table if not exists ml.model_forecasts (
+  run_id     uuid not null references ml.model_runs(run_id) on delete cascade,
+  geo_code   text not null,
+  model      text not null,
+  ds         date not null,                 -- or int year if you prefer
+  yhat       double precision not null,
+  yhat_lo    double precision,
+  yhat_hi    double precision,
+  actual     double precision,              -- nullable if future
+  primary key (run_id, ds)
+);
+
+create index if not exists ix_forecasts_geo_model_ds
+  on ml.model_forecasts(geo_code, model, ds);
+
+-- ─────────────────────────────────────────────────────────
+-- object: ml.model_leaderboard (VIEW)
+-- purpose:
+--   Rank runs within (geo_code, model) by test RMSE (then recency).
+-- refresh:
+--   plain view; always up-to-date (depends on ml.model_headline being refreshed)
+-- read pattern:
+--   picking best runs; QA
+-- ─────────────────────────────────────────────────────────
+
+
+create view ml.model_leaderboard as
+select r.geo_code, r.model, r.run_id, r.trained_at,
+       h.rmse_test, h.mae_test, h.r2_test,
+       row_number() over (
+         partition by r.geo_code, r.model
+         order by h.rmse_test asc nulls last, r.trained_at desc
+       ) as rank_within_model,
+       row_number() over (
+         partition by r.geo_code
+         order by h.rmse_test asc nulls last, r.trained_at desc
+       ) as rank_within_geo_code
+from ml.model_runs r
+left join ml.model_headline h using (run_id);
+
 
 -- ─────────────────────────────────────────────────────────
 -- Upsert function

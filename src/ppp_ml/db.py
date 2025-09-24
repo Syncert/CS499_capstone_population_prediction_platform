@@ -1,16 +1,15 @@
 from __future__ import annotations
-from typing import Tuple, List, Optional
-import pandas as pd
-from sqlalchemy import text
-import sqlalchemy as sa
 
-# single source of engine
-from ppp_common.orm import engine  # type: ignore
+from typing import List, Tuple
+import pandas as pd
+import sqlalchemy as sa
+from sqlalchemy import text
+
+from ppp_common.orm import engine
 
 def get_engine() -> sa.Engine:
     return engine
 
-#feature matrix has to be on a per geo_code basis
 def load_feature_matrix(geo_code: str) -> pd.DataFrame:
     q = text("""
         SELECT *
@@ -19,13 +18,11 @@ def load_feature_matrix(geo_code: str) -> pd.DataFrame:
         ORDER BY year
     """)
     with engine.connect() as cx:
-        return pd.read_sql(q, cx, params={"g": geo_code})
+        # Explicit return type helps Pylance; no pandas.Series aliasing.
+        df: pd.DataFrame = pd.read_sql(q, cx, params={"g": geo_code})
+    return df
 
-#helper for listing every geocode sequentially that has minimum amount of rows
 def list_geos(min_years: int = 8, require_full: bool = True) -> List[str]:
-    """
-    Return geo_codes with enough rows; optionally require has_full_features=true.
-    """
     cond = "WHERE has_full_features = true" if require_full else ""
     q = f"""
       SELECT geo_code
@@ -40,6 +37,8 @@ def list_geos(min_years: int = 8, require_full: bool = True) -> List[str]:
     return [r[0] for r in rows]
 
 def split_train_test_years(df: pd.DataFrame, split_year: int = 2020) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    train = df[df["year"] < split_year].copy()
-    test  = df[df["year"] >= split_year].copy()
+    # Make sure df["year"] is numeric to avoid dtype confusion.
+    year = pd.to_numeric(df["year"], errors="coerce")
+    train = df[year < split_year].copy()
+    test  = df[year >= split_year].copy()
     return train, test

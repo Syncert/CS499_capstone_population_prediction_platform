@@ -285,3 +285,29 @@ from ml.feature_matrix
 group by 1,2
 having count(*) > 1;
 ```
+
+## Model families & how we pick “best”
+
+We train four families per geo: **Prophet**, **Linear**, **Ridge**, **XGBoost**.  
+Each training run writes metrics to `ml.model_metrics` and a forecast snapshot to `ml.model_forecasts`.  
+A leaderboard view (`ml.model_leaderboard`) summarizes headline metrics, and the artifact pointer
+`ml.model_artifacts.best_run_id` is set to the **lowest test RMSE** for that (geo, model).
+
+### What we’ve observed on annual population
+- **Linear / Ridge**: consistently best on test RMSE and R² (often R² > 0.93; states/counties higher).
+  They capture the smooth, near-linear trend of annual population with minimal variance.
+- **XGBoost**: solid but usually behind Ridge/Linear; helpful when there’s mild nonlinearity.
+- **Prophet**: not ideal for short, annual series with no seasonality; can underperform (even negative R²).
+  We keep it in the tournament, but selection is purely metric-based.
+
+### Metric definitions (test split)
+- **RMSE** (lower is better): `sqrt(mean((yhat - actual)^2))`
+- **MAE** (lower is better): `mean(|yhat - actual|)`
+- **R²** (higher is better): `1 - SSE/SST` on test period
+
+### How “best” is computed
+We recompute “best” directly from `ml.model_metrics` (no dependency on MV freshness):
+- For a given `(geo, model)`, we rank by test RMSE ascending and set `ml.model_artifacts.best_run_id` to rank 1.
+- `ml.model_artifacts.latest_run_id` always points to the most recent successful run.
+
+**Serving default:** use `best_run_id` for all read paths unless a caller explicitly asks for a specific run.
