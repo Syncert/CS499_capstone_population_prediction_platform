@@ -38,10 +38,15 @@ services:
     command: uvicorn ppp_api.main:app --host 0.0.0.0 --port 8000 --reload
     # For production, drop volumes+command and keep the Dockerfile's CM
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8000/health || exit 1"]
+      test:
+        [
+          "CMD-SHELL",
+          "python - <<'PY'\nimport urllib.request,sys\ntry:\n  r=urllib.request.urlopen('http://localhost:8000/health', timeout=5)\n  sys.exit(0 if r.status==200 else 1)\nexcept Exception:\n  sys.exit(1)\nPY"
+        ]
       interval: 10s
-      timeout: 3s
-      retries: 5
+      timeout: 5s
+      retries: 10
+      start_period: 20s   # give uvicorn & model loading breathing room
     restart: unless-stopped
     logging:
       driver: json-file
@@ -75,5 +80,24 @@ services:
       options: { max-size: "10m", max-file: "3" }
     user: "${UID}:${GID}"
 
+
+  ui:
+    image: node:20-alpine
+    container_name: ppui
+    working_dir: /app
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./ui:/app
+      - ui_node:/app/node_modules
+    depends_on:
+      api:
+        condition: service_healthy
+    command: >
+      sh -lc "npm install --no-fund --no-audit
+      && npm run dev -- --host 0.0.0.0"
+
+
 volumes:
   pgdata:
+  ui_node:

@@ -13,6 +13,8 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from ppp_common.orm import engine as shared_engine
 from prophet.serialize import model_from_json
+from fastapi.middleware.cors import CORSMiddleware
+
 
 # -----------------------
 # Config
@@ -150,6 +152,24 @@ def _predict(model_name: str, X: pd.DataFrame) -> List[float]:
         raise HTTPException(status_code=400, detail=f"Model '{model_name}' is not loaded on server")
     y = m.predict(X)  # scikit/xgboost style
     return [float(v) for v in y]
+
+# -----------------------
+# Enable CORs Middleware
+# -----------------------
+
+app = FastAPI(title=API_TITLE, version=API_VERSION)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",   # dev browser
+        "http://127.0.0.1:5173",
+        "http://ui:5173"           # container-to-container, just in case
+    ],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
+)
 
 # -----------------------
 # Startup
@@ -310,22 +330,54 @@ def predict(req: PredictRequest):
     )
 
 
+@app.get("/actuals", dependencies=[Depends(_require_auth)], tags=["models"])
+def actuals(geo: str, start: int, end: int):
+    q = text("""
+        select year, population
+        from core.population_observations
+        where geo_code=:g and year between :y0 and :y1
+        order by year
+    """)
+    df = pd.read_sql_query(q, _get_engine(), params={"g": geo, "y0": start, "y1": end})
+    return {"geography": geo,
+            "years": df["year"].astype(int).tolist(),
+            "population": df["population"].astype(float).tolist()}
 
-# #DEBUG REMOVE LATER
-# @app.get("/debug/model/{name}", dependencies=[Depends(_require_auth)])
-# def debug_model(name: str):
-#     m = MODEL_REGISTRY.get(name)
-#     if m is None:
-#         return {"loaded": False}
-#     est = m.get("model") if isinstance(m, dict) else m
-#     return {
-#         "loaded": True,
-#         "wrapped": isinstance(m, dict),
-#         "saved_features": (m.get("features") if isinstance(m, dict) else None),
-#         "feature_names_in_": list(getattr(est, "feature_names_in_", [])) if hasattr(est, "feature_names_in_") else None,
-#         "n_features_in_": getattr(est, "n_features_in_", None),
-#         "estimator_type": type(est).__name__,
-#     }
+
+# If you persist metrics during training in ml.model_metrics(geo_code, model, mse, mae, mape, trained_at)
+@app.get("/scorecard", dependencies=[Depends(_require_auth)])
+def scorecard(geo: str):
+    q = text("""
+        select r.model, h.rmse_test, h.mae_test, h.r2_test, r.trained_at
+        from ml.model_runs r
+        join ml.model_headline h using (run_id)
+        where r.geo_code = :g
+    """)
+    df = pd.read_sql_query(q, _get_engine(), params={"g": geo})
+    # Pick your tie-breaker order explicitly:
+    order = ["mape_test", "mae_test", "rmse_test"]
+    best = None
+    if not df.empty:
+        tmp = df.copy()
+        for col in order:
+            tmp[col] = tmp[col].astype(float)
+        tmp["rank_key"] = list(zip(*(tmp[c] for c in order)))
+        best = tmp.sort_values(order, ascending=True).iloc[0]["model"]
+    return {"geography": geo, "best_model": best, "metrics": df.to_dict(orient="records")}
+
+@app.get("/series", dependencies=[Depends(_require_auth)])
+def series(geo: str, code: str, start: int, end: int):
+    q = text("""
+      select year, value::double precision as value
+      from core.indicator_values
+      where geo_code=:g and indicator_code=:c and year between :y0 and :y1
+      order by year
+    """)
+    df = pd.read_sql_query(q, _get_engine(), params={"g": geo, "c": code, "y0": start, "y1": end})
+    return {"geography": geo, "indicator_code": code,
+            "years": df["year"].astype(int).tolist(),
+            "values": [float(v) if v is not None else None for v in df["value"].tolist()]}
+
 
 
 def run():

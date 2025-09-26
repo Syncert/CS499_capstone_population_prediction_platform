@@ -34,6 +34,7 @@ create table if not exists core.population_observations (
 );
 
 create index if not exists idx_pop_year on core.population_observations(year);
+create index if not exists ix_pop_geo_year on core.population_observations(geo_code, year); -- /actuals
 
 -- ─────────────────────────────────────────────────────────
 -- core.indicator_values
@@ -57,6 +58,8 @@ create table if not exists core.indicator_values (
 create index if not exists ix_indic_year on core.indicator_values(year);
 create index if not exists ix_indic_code on core.indicator_values(indicator_code);
 create index if not exists ix_indic_geo on core.indicator_values(geo_code);
+create index if not exists ix_indic_geo_code_year on core.indicator_values(geo_code, year, indicator_code);
+
 
 -- Optional: enforce known codes via a lookup (nice but not required on day 1)
 create table if not exists core.indicator_catalog (
@@ -289,6 +292,7 @@ create table if not exists ml.model_metrics (
   primary key (run_id, metric, scope, fold)
 );
 
+create index if not exists ix_metrics_run on ml.model_metrics(run_id); 
 
 -- ─────────────────────────────────────────────────────────
 -- object: ml.model_headline (MATERIALIZED VIEW)
