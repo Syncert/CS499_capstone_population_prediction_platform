@@ -77,6 +77,11 @@ class PredictResponse(BaseModel):
     forecast: List[float]
     features_used: List[str]
 
+class GeoRow(BaseModel):
+    geo_code: str
+    geo_name: str
+    geo_type: Literal["nation","state","county"]
+
 # -----------------------
 # Helpers
 # -----------------------
@@ -519,7 +524,51 @@ def series(geo: str, code: str, start: int, end: int):
             "years": df["year"].astype(int).tolist(),
             "values": [float(v) if v is not None else None for v in df["value"].tolist()]}
 
+@app.get("/geos/nations", response_model=List[GeoRow], tags=["geography"])
+def geos_nations(only_with_data: bool = True):
+    q = text("""
+      select g.geo_code, g.geo_name, g.geo_type
+      from core.geography g
+      where g.geo_type='nation'
+        and ((:only)=false or exists (
+              select 1 from ml.feature_matrix f where f.geo_code=g.geo_code
+            ))
+      order by g.geo_name
+    """)
+    with _get_engine().connect() as c:
+        df = pd.read_sql_query(q, c, params={"only": only_with_data})
+    return df.to_dict(orient="records")
 
+@app.get("/geos/states", response_model=List[GeoRow], tags=["geography"])
+def geos_states(only_with_data: bool = True):
+    q = text("""
+      select g.geo_code, g.geo_name, g.geo_type
+      from core.geography g
+      where g.geo_type='state'
+        and ((:only)=false or exists (
+              select 1 from ml.feature_matrix f where f.geo_code=g.geo_code
+            ))
+      order by g.geo_name
+    """)
+    with _get_engine().connect() as c:
+        df = pd.read_sql_query(q, c, params={"only": only_with_data})
+    return df.to_dict(orient="records")
+
+@app.get("/geos/states/{state_fips}/counties", response_model=List[GeoRow], tags=["geography"])
+def geos_counties(state_fips: str, only_with_data: bool = True):
+    # state_fips must be 2 chars (e.g., '06'); counties are 5-digit FIPS
+    q = text("""
+      select g.geo_code, g.geo_name, g.geo_type
+      from core.geography g
+      where g.geo_type='county' and g.geo_code like :prefix || '%'
+        and ((:only)=false or exists (
+              select 1 from ml.feature_matrix f where f.geo_code=g.geo_code
+            ))
+      order by g.geo_name
+    """)
+    with _get_engine().connect() as c:
+        df = pd.read_sql_query(q, c, params={"prefix": state_fips, "only": only_with_data})
+    return df.to_dict(orient="records")
 
 def run():
     import uvicorn

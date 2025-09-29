@@ -5,6 +5,8 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Line } from "react-chartjs-2";
 import "chart.js/auto";
+// in PopulationDashboard.jsx
+import GeoPickers from "./GeoPickers.jsx";
 
 // --- Quick notes -------------------------------------------------------------
 // 1) Drop this file into a Vite React app as src/PopulationDashboard.jsx.
@@ -211,7 +213,7 @@ export default function PopulationDashboard() {
         <CardContent className="p-4 grid md:grid-cols-6 gap-4 items-end">
           <div className="md:col-span-2">
             <Label>Geography</Label>
-            <Input placeholder="US | 2-digit FIPS | 5-digit FIPS" value={geography} onChange={(e) => setGeography(e.target.value)} />
+            <GeoPickers apiBase={apiBase} onGeoChange={setGeography} />
           </div>
           <div>
             <Label>Start Year</Label>
