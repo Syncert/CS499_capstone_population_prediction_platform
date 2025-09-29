@@ -80,6 +80,7 @@ export default function PopulationDashboard() {
   const [message, setMessage] = useState("");
 
   const loggedIn = !!token;
+
   const years = useMemo(() => {
     const y0 = Number(startYear), y1 = Number(endYear);
     const out = []; for (let y = y0; y <= y1; y++) out.push(y);
@@ -154,14 +155,17 @@ export default function PopulationDashboard() {
   };
 
   const chartData = useMemo(() => {
-   const datasets = series.map((s, i) => ({
-     label: s.label,
-     data: s.values,
-     fill: false,
-     tension: 0.15,
-     pointRadius: 2,
-     borderWidth: 2,
-   }));
+  const datasets = series.map(s => {
+    const byYear = new Map(s.years.map((y,i) => [y, s.values[i]]));
+    return {
+      label: s.label,
+      data: years.map(y => (byYear.has(y) ? byYear.get(y) : null)), // align by year
+      spanGaps: true,
+      tension: 0.15,
+      pointRadius: 2,
+      borderWidth: 2,
+    };
+  });
    if (actuals && actuals.years?.length) {
      datasets.unshift({
        label: "actual",

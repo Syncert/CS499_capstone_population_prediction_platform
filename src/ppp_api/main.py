@@ -153,6 +153,7 @@ def _roll_forward_predict(
     start_next_year: int,
     end_year: int,
     feature_cols: List[str],            # exact model input order (after rename/selection)
+    use_delta: bool = False,           # whether model predicts delta vs level
 ) -> Tuple[List[int], List[float]]:
     """
     One-step-ahead roll forward:
@@ -219,21 +220,27 @@ def _roll_forward_predict(
         X_next = pd.DataFrame([feat_row], columns=feature_cols).astype("float64")
 
         try:
-            yhat = float(estimator.predict(X_next.to_numpy(copy=False))[0])
+            yhat_raw = float(estimator.predict(X_next.to_numpy(copy=False))[0])
         except Exception:
-            yhat = float(estimator.predict(X_next)[0])
+            yhat_raw = float(estimator.predict(X_next)[0])
+
+        if use_delta:
+            base_next = float(lag1) if lag1 is not None else last_num("population", 0.0)
+            yhat_level = yhat_raw + base_next
+        else:
+            yhat_level = yhat_raw
 
         years_out.append(int(y))
-        preds_out.append(yhat)
+        preds_out.append(yhat_level)
 
-        # append this prediction to history so the next step can see it
+        # append to history as the new 'population'
         rows = pd.concat(
-            [rows, pd.DataFrame([{"year": int(y), "population": yhat,
-                                  "unemployment_rate": unrate,
-                                  "rent_cpi_index": rent_cpi,
-                                  "pop_lag1": lag1 if lag1 is not None else 0.0,
-                                  "pop_lag5": lag5 if lag5 is not None else 0.0,
-                                  "pop_ma3": ma3}])],
+            [rows, pd.DataFrame([{"year": int(y), "population": yhat_level,
+                                "unemployment_rate": unrate,
+                                "rent_cpi_index": rent_cpi,
+                                "pop_lag1": lag1 if lag1 is not None else 0.0,
+                                "pop_lag5": lag5 if lag5 is not None else 0.0,
+                                "pop_ma3": ma3}])],
             ignore_index=True
         ).sort_values("year")
 
@@ -388,6 +395,10 @@ def predict(req: PredictRequest):
 
     # unwrap dict artifacts: {"model": estimator, "features": [...], "rename_map": {...}}
     estimator = m.get("model") if isinstance(m, dict) else m
+
+    #check model features for use of delta
+    use_delta = bool(m.get("use_delta")) if isinstance(m, dict) else False
+
     if estimator is None or not hasattr(estimator, "predict"):
         raise HTTPException(status_code=400, detail=f"model '{model_name}' for geo={geo} is not a valid predictor")
 
@@ -417,6 +428,12 @@ def predict(req: PredictRequest):
         yhat = estimator.predict(X)
     except Exception:
         yhat = estimator.predict(X.to_numpy(copy=False))
+
+    if use_delta:
+        # add back the base for each row (aligned to X)
+        base = pd.to_numeric(df.loc[X.index, "pop_lag1"], errors="coerce").fillna(0.0).to_numpy("float64")
+        yhat = yhat + base
+
     yhat = [float(v) for v in yhat]
 
     years_in = df["year"].astype(int).tolist()
@@ -439,6 +456,7 @@ def predict(req: PredictRequest):
             start_next_year=max_cov_year + 1,
             end_year=int(req.end_year),
             feature_cols=feature_order,
+            use_delta=use_delta,
         )
 
         years_in += extra_years
