@@ -494,22 +494,51 @@ def actuals(geo: str, start: int, end: int):
 @app.get("/scorecard", dependencies=[Depends(_require_auth)])
 def scorecard(geo: str):
     q = text("""
-        select r.model, h.rmse_test, h.mae_test, h.r2_test, r.trained_at
-        from ml.model_runs r
-        join ml.model_headline h using (run_id)
-        where r.geo_code = :g
+                WITH scored AS (
+                SELECT r.geo_code, r.model, r.run_id, r.trained_at,
+                        h.rmse_test, h.mae_test, h.r2_test
+                FROM ml.model_runs r
+                LEFT JOIN ml.model_headline h USING (run_id)
+                WHERE r.geo_code = :g
+                ),
+                best_per_model AS (
+                SELECT *,
+                        ROW_NUMBER() OVER (
+                        PARTITION BY geo_code, model
+                        ORDER BY rmse_test ASC NULLS LAST, trained_at DESC
+                        ) AS rwm
+                FROM scored
+                ),
+                picked AS (
+                SELECT * FROM best_per_model WHERE rwm = 1
+                )
+                SELECT *,
+                    ROW_NUMBER() OVER (
+                        ORDER BY rmse_test ASC NULLS LAST, trained_at DESC
+                    ) AS rank_within_geo_code
+                FROM picked
+                ORDER BY rank_within_geo_code;
     """)
     df = pd.read_sql_query(q, _get_engine(), params={"g": geo})
-    # Pick your tie-breaker order explicitly:
-    order = ["mape_test", "mae_test", "rmse_test"]
-    best = None
+
+    best = df.iloc[0]["model"]
     if not df.empty:
-        tmp = df.copy()
-        for col in order:
-            tmp[col] = tmp[col].astype(float)
-        tmp["rank_key"] = list(zip(*(tmp[c] for c in order)))
-        best = tmp.sort_values(order, ascending=True).iloc[0]["model"]
-    return {"geography": geo, "best_model": best, "metrics": df.to_dict(orient="records")}
+        # make numbers JSON-safe (optional but nice)
+        for c in ["rmse_test", "mae_test", "r2_test"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce").astype(float)
+        for c in ["rank_within_model", "rank_within_geo_code"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+        if "trained_at" in df.columns:
+            df["trained_at"] = pd.to_datetime(df["trained_at"], errors="coerce") \
+                                .dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    return {
+        "geography": geo,
+        "best_model": best,
+        "metrics": df.to_dict(orient="records")
+    }
 
 @app.get("/series", dependencies=[Depends(_require_auth)])
 def series(geo: str, code: str, start: int, end: int):

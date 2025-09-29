@@ -1,2 +1,17 @@
-html, body, #root { height: 100%; margin: 0; }
-* { box-sizing: border-box; }
+/* basic layout + cards */
+.container { max-width: 1100px; margin: 2rem auto; padding: 0 1rem; }
+.section { margin: 1.5rem 0; }
+.card { background:#fff; border:1px solid #e5e7eb; border-radius:14px; box-shadow:0 1px 2px rgba(0,0,0,.04); }
+.card-body { padding: 1rem; }
+.h1 { font-size: 1.75rem; font-weight: 800; margin: .25rem 0 1rem; }
+.h2 { font-size: 1.25rem; font-weight: 700; margin: 0 0 .75rem; }
+.toolbar { display:flex; gap:.5rem; flex-wrap:wrap; align-items:end; }
+.grid-3 { display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:.75rem; }
+.muted { color:#6b7280; font-size:.9rem; }
+.table { width:100%; border-collapse: collapse; }
+.table th, .table td { padding:.5rem .6rem; border-bottom:1px solid #eee; text-align:left; }
+.badge { display:inline-block; padding:.15rem .5rem; border-radius:9999px; font-size:.75rem; background:#eef2ff; color:#3730a3; }
+details.controls { border-radius:12px; border:1px solid #e5e7eb; background:#fafafa; }
+details.controls > summary { cursor:pointer; padding:.6rem .8rem; font-weight:600; }
+details.controls[open] > summary { border-bottom:1px solid #e5e7eb; }
+.controls-body { padding:.8rem; }

@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Line } from "react-chartjs-2";
+import "./index.css";
 import "chart.js/auto";
 // in PopulationDashboard.jsx
 import GeoPickers from "./GeoPickers.jsx";
@@ -55,69 +56,119 @@ function useApi(baseUrl) {
     return res.json();
   };
 
-  return { login, predict, metrics };
+  const scorecard = async (token, geo) => {
+    const r = await fetch(`${baseUrl}/scorecard?geo=${encodeURIComponent(geo)}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    if (!r.ok) throw new Error(`Scorecard failed: ${r.status}`);
+    return r.json(); // { geography, best_model, metrics: [...] }
+  };
+
+  const actuals = async (token, geo, start, end) => {
+    const r = await fetch(`${baseUrl}/actuals?geo=${encodeURIComponent(geo)}&start=${start}&end=${end}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    if (!r.ok) throw new Error(`Actuals failed: ${r.status}`);
+    return r.json(); // { geography, years, population }
+  };
+
+  return { login, predict, metrics, scorecard, actuals };
 }
 
 export default function PopulationDashboard() {
-  // --- API config ------------------------------------------------------------
+  // API/auth
   const [apiBase, setApiBase] = useState(API_BASE_DEFAULT);
   const api = useApi(apiBase);
-
-  // --- Auth ------------------------------------------------------------------
   const [username, setUsername] = useState("admin");
   const [password, setPassword] = useState("changeme");
   const [token, setToken] = useState("");
 
-  // --- Request controls ------------------------------------------------------
-  const [geography, setGeography] = useState("US"); // e.g., "US", "01" (AL state), "01001" (county)
+  // Controls
+  const [geography, setGeography] = useState("US");
   const [startYear, setStartYear] = useState(2012);
-  const [endYear, setEndYear] = useState(2025);
-  const [selectedModels, setSelectedModels] = useState(ALL_MODELS);
-
-  // --- Results ---------------------------------------------------------------
-  const [series, setSeries] = useState([]); // [{label, years[], values[]}]
-  const [featuresByModel, setFeaturesByModel] = useState({});
-  const [actuals, setActuals] = useState(null); // {years[], population[]}
+  const [endYear, setEndYear] = useState(2030);
+  const [selectedModels, setSelectedModels] = useState(["linear", "ridge", "xgb", "prophet"]);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
 
-  const loggedIn = !!token;
+  // All-models chart data
+  const [series, setSeries] = useState([]); // [{label, years, values}]
+  const [featuresByModel, setFeaturesByModel] = useState({});
 
+  // Best-model chart + leaderboard
+  const [bestModel, setBestModel] = useState(null);        // "ridge" | "xgb" | ...
+  const [bestSeries, setBestSeries] = useState(null);      // { years, values, label }
+  const [leaderboard, setLeaderboard] = useState([]);      // rows from /scorecard.metrics
+
+  const loggedIn = !!token;
   const years = useMemo(() => {
     const y0 = Number(startYear), y1 = Number(endYear);
     const out = []; for (let y = y0; y <= y1; y++) out.push(y);
     return out;
   }, [startYear, endYear]);
 
-  const fetchActuals = async () => {
-    const url = `${apiBase}/actuals?geo=${encodeURIComponent(geography)}&start=${Number(startYear)}&end=${Number(endYear)}`;
-    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-    if (!res.ok) throw new Error(`Actuals failed: ${res.status}`);
-    const j = await res.json();
-    setActuals(j);
-  };
-
+  // login as you already do
   const doLogin = async () => {
     try {
       setMessage("Logging in…");
       const { access_token } = await api.login(username, password);
       setToken(access_token);
       setMessage("Logged in.");
-    } catch (e) {
-      setMessage(e.message);
+    } catch (e) { setMessage(e.message); }
+  };
+
+  const toggleModel = (m) =>
+    setSelectedModels((prev) => prev.includes(m) ? prev.filter(x => x !== m) : [...prev, m]);
+
+  // === fetch “Best Model” and leaderboard ===
+  const fetchBestAndLeaderboard = async () => {
+    if (!loggedIn) return;
+    const sc = await api.scorecard(token, geography);
+    setBestModel(sc.best_model || null);
+    setLeaderboard(sc.metrics || []);
+
+    if (sc.best_model) {
+      // best model series + actuals
+      const [pred, act] = await Promise.all([
+        api.predict(token, {
+          geography,
+          start_year: Number(startYear),
+          end_year: Number(endYear),
+          model: sc.best_model,
+        }),
+        api.actuals(token, geography, Number(startYear), Number(endYear)),
+      ]);
+
+      // Align to shared x-axis
+      const yrs = years;
+      const yhat = yrs.map(y => {
+        const i = pred.years.indexOf(y);
+        return i >= 0 ? pred.forecast[i] : null;
+      });
+      const actual = yrs.map(y => {
+        const i = act.years.indexOf(y);
+        return i >= 0 ? act.population[i] : null;
+      });
+
+      setBestSeries({
+        label: `${sc.best_model}`,
+        years: yrs,
+        values: yhat,
+        actual,
+      });
+    } else {
+      setBestSeries(null);
     }
   };
 
-  const toggleModel = (m) => {
-    setSelectedModels((prev) =>
-      prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m]
-    );
-  };
-
+  // your existing fetchPredictions, but keep it focused on “all models”
   const fetchPredictions = async () => {
     if (!loggedIn) { setMessage("Please log in first."); return; }
     setBusy(true); setMessage("");
     try {
+      // actuals (for the comparison chart baseline)
+      const act = await api.actuals(token, geography, Number(startYear), Number(endYear));
+
       const results = await Promise.all(
         selectedModels.map(async (m) => {
           const res = await api.predict(token, {
@@ -129,7 +180,6 @@ export default function PopulationDashboard() {
           return { m, res };
         })
       );
-      await fetchActuals();
 
       const s = results.map(({ m, res }) => ({
         label: `${m}`,
@@ -137,12 +187,22 @@ export default function PopulationDashboard() {
         values: res.forecast,
       }));
 
+      // prepend actuals series for this chart too
+      s.unshift({
+        label: "actual",
+        years: act.years,
+        values: act.population,
+      });
+
+      setSeries(s);
+
       const fx = Object.fromEntries(
         results.map(({ m, res }) => [m, res.features_used || []])
       );
-
-      setSeries(s);
       setFeaturesByModel(fx);
+
+      // best model / leaderboard
+      await fetchBestAndLeaderboard();
     } catch (e) {
       setMessage(e.message);
     } finally {
@@ -153,136 +213,180 @@ export default function PopulationDashboard() {
   const clearAll = () => {
     setSeries([]);
     setFeaturesByModel({});
+    setBestSeries(null);
+    setLeaderboard([]);
     setMessage("");
   };
 
-  const chartData = useMemo(() => {
-  const datasets = series.map(s => {
-    const byYear = new Map(s.years.map((y,i) => [y, s.values[i]]));
-    return {
+  // chart builders
+  const makeChart = (labels, lines) => ({
+    labels,
+    datasets: lines.map((s) => ({
       label: s.label,
-      data: years.map(y => (byYear.has(y) ? byYear.get(y) : null)), // align by year
+      data: s.values,
       spanGaps: true,
-      tension: 0.15,
+      tension: 0.2,
       pointRadius: 2,
       borderWidth: 2,
-    };
+      fill: false,
+    })),
   });
-   if (actuals && actuals.years?.length) {
-     datasets.unshift({
-       label: "actual",
-       data: actuals.population,
-       borderDash: [6, 4],
-       pointRadius: 1,
-       borderWidth: 2,
-     });
-   }
-   return {
-      labels: years,
-     datasets
-    };
- }, [years, series, actuals]);
 
+  const allModelsChart = useMemo(() => {
+    const labels = years;
+    const aligned = series.map(s => ({
+      label: s.label,
+      values: labels.map(y => {
+        const i = s.years.indexOf(y);
+        return i >= 0 ? s.values[i] : null;
+      })
+    }));
+    return makeChart(labels, aligned);
+  }, [series, years]);
+
+  const bestChart = useMemo(() => {
+    if (!bestSeries) return null;
+    const labels = bestSeries.years;
+    return makeChart(labels, [
+      { label: "actual", values: bestSeries.actual },
+      { label: bestSeries.label, values: bestSeries.values },
+    ]);
+  }, [bestSeries]);
+
+  // ─────────────────────────────────────────────────────────────
+  // RENDER
+  // ─────────────────────────────────────────────────────────────
   return (
-    <div className="p-6 grid gap-6 max-w-6xl mx-auto">
-      <h1 className="text-2xl font-bold">Population Prediction — Front-End (Week 5)</h1>
+    <div className="container">
+      <h1 className="h1">Population Prediction — Front-End</h1>
 
-      {/* API + Auth */}
-      <Card className="shadow">
-        <CardContent className="p-4 grid md:grid-cols-4 gap-4 items-end">
-          <div>
-            <Label>API Base</Label>
-            <Input value={apiBase} onChange={(e) => setApiBase(e.target.value)} />
-          </div>
-          <div>
-            <Label>Username</Label>
-            <Input value={username} onChange={(e) => setUsername(e.target.value)} />
-          </div>
-          <div>
-            <Label>Password</Label>
-            <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
-          </div>
-          <div className="flex gap-2">
-            <Button onClick={doLogin} className="w-full">{loggedIn ? "Re-Login" : "Login"}</Button>
-          </div>
-        </CardContent>
-      </Card>
+      {/* CONTROLS (collapsible) */}
+      <section className="section">
+        <details className="controls" open>
+          <summary>Controls</summary>
+          <div className="controls-body">
+            <div className="card">
+              <div className="card-body">
+                <div className="toolbar grid-3">
+                  <div>
+                    <div className="muted">API Base</div>
+                    <input value={apiBase} onChange={(e)=>setApiBase(e.target.value)} />
+                  </div>
+                  <div>
+                    <div className="muted">Username</div>
+                    <input value={username} onChange={(e)=>setUsername(e.target.value)} />
+                  </div>
+                  <div>
+                    <div className="muted">Password</div>
+                    <input type="password" value={password} onChange={(e)=>setPassword(e.target.value)} />
+                  </div>
+                </div>
 
-      {/* Controls */}
-      <Card className="shadow">
-        <CardContent className="p-4 grid md:grid-cols-6 gap-4 items-end">
-          <div className="md:col-span-2">
-            <Label>Geography</Label>
-            <GeoPickers apiBase={apiBase} onGeoChange={setGeography} />
-          </div>
-          <div>
-            <Label>Start Year</Label>
-            <Input type="number" value={startYear} onChange={(e) => setStartYear(e.target.value)} />
-          </div>
-          <div>
-            <Label>End Year</Label>
-            <Input type="number" value={endYear} onChange={(e) => setEndYear(e.target.value)} />
-          </div>
-          <div className="md:col-span-2">
-            <Label>Models</Label>
-            <div className="flex flex-wrap gap-2 pt-2">
-              {ALL_MODELS.map((m) => (
-                <Button key={m} variant={selectedModels.includes(m) ? "default" : "secondary"} size="sm" onClick={() => toggleModel(m)}>
-                  {m}
-                </Button>
-              ))}
+                <div style={{height:8}} />
+
+                <div className="toolbar grid-3">
+                  <div>
+                    <div className="muted">Geography</div>
+                    {/* If you wired GeoPickers, drop it here */}
+                    {<GeoPickers apiBase={apiBase} onGeoChange={setGeography} />}
+                  </div>
+                  <div>
+                    <div className="muted">Start Year</div>
+                    <input type="number" value={startYear} onChange={(e)=>setStartYear(e.target.value)} />
+                  </div>
+                  <div>
+                    <div className="muted">End Year</div>
+                    <input type="number" value={endYear} onChange={(e)=>setEndYear(e.target.value)} />
+                  </div>
+                </div>
+
+                <div style={{height:8}} />
+
+                <div className="toolbar">
+                  <button onClick={doLogin} className="badge">
+                    {loggedIn ? "Re-Login" : "Login"}
+                  </button>
+                  <button onClick={fetchPredictions} disabled={busy}>
+                    {busy ? "Fetching…" : "Fetch Predictions"}
+                  </button>
+                  <button onClick={clearAll}>Clear</button>
+                  <div className="muted">{message}</div>
+                </div>
+              </div>
             </div>
           </div>
-          <div className="md:col-span-6 flex gap-2">
-            <Button onClick={fetchPredictions} disabled={busy}>
-              {busy ? "Fetching…" : "Fetch Predictions"}
-            </Button>
-            <Button variant="secondary" onClick={clearAll}>Clear</Button>
+        </details>
+      </section>
+
+      {/* BEST MODEL PREDICTIONS */}
+      <section className="section">
+        <div className="h2">Best Model Predictions {bestModel && <span className="badge">{bestModel}</span>}</div>
+        <div className="card">
+          <div className="card-body">
+            {bestChart ? (
+              <Line data={bestChart} options={{
+                responsive: true,
+                plugins: { legend: { position: "bottom" } },
+                interaction: { mode: "index", intersect: false },
+                scales: { x: { title: { display:true, text:"Year" } }, y: { title: { display:true, text:"Population" } } }
+              }} />
+            ) : (
+              <div className="muted">Run “Fetch Predictions” to populate the best-model chart.</div>
+            )}
           </div>
-        </CardContent>
-      </Card>
+        </div>
+      </section>
 
-      {/* Chart */}
-      <Card className="shadow">
-        <CardContent className="p-4">
-          <div className="text-sm text-muted-foreground pb-2">
-            Compare forecasts for the selected models. Each series is returned by FastAPI /predict.
+      {/* COMPARISON OF ALL MODELS */}
+      <section className="section">
+        <div className="h2">Comparison of All Model Predictions</div>
+        <div className="card">
+          <div className="card-body">
+            {series.length ? (
+              <Line data={allModelsChart} options={{
+                responsive: true,
+                plugins: { legend: { position: "bottom" } },
+                interaction: { mode: "index", intersect: false },
+                scales: { x: { title: { display:true, text:"Year" } }, y: { title: { display:true, text:"Population" } } }
+              }} />
+            ) : (
+              <div className="muted">No series yet. Click “Fetch Predictions”.</div>
+            )}
           </div>
-          <Line data={chartData} options={{
-            responsive: true,
-            plugins: { legend: { position: "bottom" } },
-            interaction: { mode: "index", intersect: false },
-            scales: { x: { title: { display: true, text: "Year" } }, y: { title: { display: true, text: "Population" } } }
-          }} />
-        </CardContent>
-      </Card>
+        </div>
+      </section>
 
-      {/* Features used per model */}
-      {Object.keys(featuresByModel).length > 0 && (
-        <Card className="shadow">
-          <CardContent className="p-4">
-            <h2 className="font-semibold mb-2">Features used (as reported by /predict)</h2>
-            <ul className="grid md:grid-cols-2 gap-4">
-              {Object.entries(featuresByModel).map(([m, feats]) => (
-                <li key={m} className="text-sm">
-                  <span className="font-medium">{m}:</span> {feats && feats.length ? feats.join(", ") : "(none reported)"}
-                </li>
-              ))}
-            </ul>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Messages */}
-      {message && (
-        <div className="text-sm text-red-600">{message}</div>
-      )}
-
-      {/* Footer hint */}
-      <div className="text-xs text-muted-foreground">
-        Tip: For the US/State/County pages you sketched, mount this component three times with different presets
-        and add a map widget (e.g., topojson + d3-geo or a static SVG) to highlight the selected region.
-      </div>
+      {/* MODEL LEADERBOARD */}
+      <section className="section">
+        <div className="h2">Model Leaderboard</div>
+        <div className="card">
+          <div className="card-body">
+            {leaderboard.length ? (
+              <table className="table">
+                <thead>
+                  <tr><th>Rank</th><th>Model</th><th>RMSE (test)</th><th>MAE (test)</th><th>R² (test)</th><th>Trained At</th></tr>
+                </thead>
+                <tbody>
+                  {[...leaderboard]
+                    .sort((a,b) => (a.rmse_test ?? 1e9) - (b.rmse_test ?? 1e9))
+                    .map(r => (
+                      <tr key={r.run_id}>
+                        <td>{r.rank_within_geo_code ?? "—"}</td>
+                        <td>{r.model}</td>
+                        <td>{r.rmse_test ?? "—"}</td>
+                        <td>{r.mae_test ?? "—"}</td>
+                        <td>{r.r2_test ?? "—"}</td>
+                        <td>{r.trained_at?.slice(0,19).replace("T"," ") ?? "—"}</td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            ) : (
+              <div className="muted">Leaderboard will populate after “Fetch Predictions”.</div>
+            )}
+          </div>
+        </div>
+      </section>
     </div>
   );
 }
