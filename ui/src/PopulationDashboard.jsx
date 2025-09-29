@@ -70,11 +70,12 @@ export default function PopulationDashboard() {
   const [geography, setGeography] = useState("US"); // e.g., "US", "01" (AL state), "01001" (county)
   const [startYear, setStartYear] = useState(2012);
   const [endYear, setEndYear] = useState(2025);
-  const [selectedModels, setSelectedModels] = useState(["linear", "ridge", "xgb"]);
+  const [selectedModels, setSelectedModels] = useState(ALL_MODELS);
 
   // --- Results ---------------------------------------------------------------
   const [series, setSeries] = useState([]); // [{label, years[], values[]}]
   const [featuresByModel, setFeaturesByModel] = useState({});
+  const [actuals, setActuals] = useState(null); // {years[], population[]}
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
 
@@ -84,6 +85,14 @@ export default function PopulationDashboard() {
     const out = []; for (let y = y0; y <= y1; y++) out.push(y);
     return out;
   }, [startYear, endYear]);
+
+  const fetchActuals = async () => {
+    const url = `${apiBase}/actuals?geo=${encodeURIComponent(geography)}&start=${Number(startYear)}&end=${Number(endYear)}`;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) throw new Error(`Actuals failed: ${res.status}`);
+    const j = await res.json();
+    setActuals(j);
+  };
 
   const doLogin = async () => {
     try {
@@ -117,6 +126,7 @@ export default function PopulationDashboard() {
           return { m, res };
         })
       );
+      await fetchActuals();
 
       const s = results.map(({ m, res }) => ({
         label: `${m}`,
@@ -144,18 +154,28 @@ export default function PopulationDashboard() {
   };
 
   const chartData = useMemo(() => {
-    return {
+   const datasets = series.map((s, i) => ({
+     label: s.label,
+     data: s.values,
+     fill: false,
+     tension: 0.15,
+     pointRadius: 2,
+     borderWidth: 2,
+   }));
+   if (actuals && actuals.years?.length) {
+     datasets.unshift({
+       label: "actual",
+       data: actuals.population,
+       borderDash: [6, 4],
+       pointRadius: 1,
+       borderWidth: 2,
+     });
+   }
+   return {
       labels: years,
-      datasets: series.map((s, i) => ({
-        label: s.label,
-        data: s.values,
-        fill: false,
-        tension: 0.15,
-        pointRadius: 2,
-        borderWidth: 2,
-      })),
+     datasets
     };
-  }, [years, series]);
+ }, [years, series, actuals]);
 
   return (
     <div className="p-6 grid gap-6 max-w-6xl mx-auto">

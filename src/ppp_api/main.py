@@ -3,7 +3,7 @@ import os
 import time
 import pickle
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Literal
+from typing import Optional, List, Dict, Any, Literal, Tuple
 import pandas as pd
 import jwt
 from fastapi import FastAPI, Depends, HTTPException, status
@@ -146,12 +146,108 @@ def _fetch_features_window(geo_code: str, start_year: int, end_year: int) -> pd.
     eng = _get_engine()
     return pd.read_sql_query(q, eng, params={"geo": geo_code, "y0": start_year, "y1": end_year})
 
+#this is for rolling forward the feature matrix past known years
+def _roll_forward_predict(
+    estimator,
+    hist_df: pd.DataFrame,              # rows up through last covered year
+    start_next_year: int,
+    end_year: int,
+    feature_cols: List[str],            # exact model input order (after rename/selection)
+) -> Tuple[List[int], List[float]]:
+    """
+    One-step-ahead roll forward:
+      • Holds exogenous (e.g., unemployment_rate, rent_cpi_index) flat at last known value.
+      • Recomputes lag/MA features from the growing history of {actuals + our yhat}.
+      • Leaves growth features (pop_yoy_growth_pct, pop_cagr_5yr_pct) at 0.0 for stability.
+    """
+    rows = hist_df.copy().sort_values("year")
+
+    def last_num(col: str, default: float = 0.0) -> float:
+        if col in rows.columns:
+            s = pd.to_numeric(rows[col], errors="coerce").dropna()
+            if not s.empty:
+                return float(s.iloc[-1])
+        return float(default)
+
+    def get_pop(yr: int) -> float | None:
+        if "population" not in rows.columns:
+            return None
+        s = pd.to_numeric(
+            rows.loc[rows["year"].astype(int) == int(yr), "population"],
+            errors="coerce"
+        ).dropna()
+        return float(s.iloc[0]) if not s.empty else None
+
+    years_out: List[int] = []
+    preds_out: List[float] = []
+
+    for y in range(int(start_next_year), int(end_year) + 1):
+        # exogenous (held flat)
+        unrate = last_num("unemployment_rate", 0.0)
+        rent_cpi = last_num("rent_cpi_index", 0.0)
+
+        # lags / MA from history (actuals + our previous preds)
+        lag1 = get_pop(y - 1)
+        lag5 = get_pop(y - 5)
+        # simple MA of the last two available years (y-2, y-1) if present
+        ma_vals = [v for v in (get_pop(y - 2), get_pop(y - 1)) if v is not None]
+        ma3 = float(sum(ma_vals) / len(ma_vals)) if ma_vals else last_num("population", 0.0)
+
+        # fill a feature row in the exact order the model expects
+        feat_row: List[float] = []
+        for c in feature_cols:
+            if c == "year":
+                feat_row.append(float(y))
+            elif c == "unemployment_rate":
+                feat_row.append(float(unrate))
+            elif c == "rent_cpi_index":
+                feat_row.append(float(rent_cpi))
+            elif c == "pop_lag1":
+                feat_row.append(float(lag1) if lag1 is not None else 0.0)
+            elif c == "pop_lag5":
+                feat_row.append(float(lag5) if lag5 is not None else 0.0)
+            elif c == "pop_ma3":
+                feat_row.append(float(ma3))
+            elif c == "pop_yoy_growth_pct":
+                feat_row.append(0.0)          # conservative placeholder
+            elif c == "pop_cagr_5yr_pct":
+                feat_row.append(0.0)          # conservative placeholder
+            else:
+                # any other numeric feature → hold last known numeric value (or 0.0)
+                feat_row.append(last_num(c, 0.0))
+
+        X_next = pd.DataFrame([feat_row], columns=feature_cols).astype("float64")
+
+        try:
+            yhat = float(estimator.predict(X_next.to_numpy(copy=False))[0])
+        except Exception:
+            yhat = float(estimator.predict(X_next)[0])
+
+        years_out.append(int(y))
+        preds_out.append(yhat)
+
+        # append this prediction to history so the next step can see it
+        rows = pd.concat(
+            [rows, pd.DataFrame([{"year": int(y), "population": yhat,
+                                  "unemployment_rate": unrate,
+                                  "rent_cpi_index": rent_cpi,
+                                  "pop_lag1": lag1 if lag1 is not None else 0.0,
+                                  "pop_lag5": lag5 if lag5 is not None else 0.0,
+                                  "pop_ma3": ma3}])],
+            ignore_index=True
+        ).sort_values("year")
+
+    return years_out, preds_out
+
+
 def _predict(model_name: str, X: pd.DataFrame) -> List[float]:
     m = MODEL_REGISTRY.get(model_name)
     if m is None:
         raise HTTPException(status_code=400, detail=f"Model '{model_name}' is not loaded on server")
     y = m.predict(X)  # scikit/xgboost style
     return [float(v) for v in y]
+
+
 
 # -----------------------
 # Enable CORs Middleware
@@ -266,6 +362,7 @@ def predict(req: PredictRequest):
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"prophet prediction failed: {e}")
 
+
     # ----------------------------
     # Sklearn/XGB: per-geo estimator (pickle) + feature_matrix window
     # ----------------------------
@@ -315,17 +412,43 @@ def predict(req: PredictRequest):
 
     X = X.astype("float64")
 
-    # Some XGB wrappers behave best with numpy arrays in exact order
+    # In-coverage prediction (years that exist in feature_matrix)
     try:
         yhat = estimator.predict(X)
     except Exception:
         yhat = estimator.predict(X.to_numpy(copy=False))
+    yhat = [float(v) for v in yhat]
+
+    years_in = df["year"].astype(int).tolist()
+    forecast = yhat
+
+    # If the user asked beyond the last covered year, roll forward
+    max_cov_year = max(years_in)
+    if req.end_year > max_cov_year:
+        # Build a base DF that includes the columns the roll-forward needs.
+        # Use the *actual* population from feature_matrix for history up to max_cov_year.
+        # (If you prefer to “own” the history, you can swap in your model’s yhat for 'population'.)
+        df_base = df.copy()
+
+        # exact feature order the model expects after any renames
+        feature_order = list(X.columns)
+
+        extra_years, extra_preds = _roll_forward_predict(
+            estimator=estimator,
+            hist_df=df_base,                  # <-- name matches helper’s signature
+            start_next_year=max_cov_year + 1,
+            end_year=int(req.end_year),
+            feature_cols=feature_order,
+        )
+
+        years_in += extra_years
+        forecast += extra_preds
 
     return PredictResponse(
         geography=geo,
         model=model_name,
-        years=df["year"].astype(int).tolist(),
-        forecast=[float(v) for v in yhat],
+        years=years_in,
+        forecast=forecast,
         features_used=list(X.columns) if saved_feats is None else saved_feats,
     )
 
