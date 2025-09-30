@@ -421,9 +421,9 @@ const handleDownloadAllModels = async () => {
                       <tr key={r.run_id}>
                         <td>{r.rank_within_geo_code ?? "—"}</td>
                         <td>{r.model}</td>
-                        <td>{r.rmse_test ?? "—"}</td>
-                        <td>{r.mae_test ?? "—"}</td>
-                        <td>{r.r2_test ?? "—"}</td>
+                        <td>{r.rmse_test != null ? Number(r.rmse_test).toFixed(2) : "—"}</td>
+                        <td>{r.mae_test  != null ? Number(r.mae_test).toFixed(2) : "—"}</td>
+                        <td>{r.r2_test   != null ? Number(r.r2_test).toFixed(2) : "—"}</td>
                         <td>{r.trained_at?.slice(0,19).replace("T"," ") ?? "—"}</td>
                       </tr>
                     ))}
