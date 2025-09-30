@@ -72,7 +72,23 @@ function useApi(baseUrl) {
     return r.json(); // { geography, years, population }
   };
 
-  return { login, predict, metrics, scorecard, actuals };
+  // inside useApi
+  const featuresCompare = async (token, { geo, start, end, model }) => {
+    const qs = new URLSearchParams({
+      geo: String(geo),
+      start: String(start),
+      end: String(end),
+      model: String(model || "linear"),
+    });
+    const r = await fetch(`${baseUrl}/features/compare?${qs.toString()}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!r.ok) throw new Error(`features/compare failed: ${r.status}`);
+    return r.json();
+  };
+
+
+  return { login, predict, metrics, scorecard, actuals, featuresCompare };
 }
 
 export default function PopulationDashboard() {
@@ -99,6 +115,9 @@ export default function PopulationDashboard() {
   const [bestModel, setBestModel] = useState(null);        // "ridge" | "xgb" | ...
   const [bestSeries, setBestSeries] = useState(null);      // { years, values, label }
   const [leaderboard, setLeaderboard] = useState([]);      // rows from /scorecard.metrics
+
+  // for features ACS FRED BLS Charts
+  const [featuresBundle, setFeaturesBundle] = useState(null);
 
   const loggedIn = !!token;
   const years = useMemo(() => {
@@ -203,10 +222,30 @@ export default function PopulationDashboard() {
 
       // best model / leaderboard
       await fetchBestAndLeaderboard();
+      await fetchFeatures();
     } catch (e) {
       setMessage(e.message);
     } finally {
       setBusy(false);
+    }
+  };
+
+  // fetch features for ACS FRED BLS Charts
+  const fetchFeatures = async () => {
+    if (!loggedIn) { setMessage("Please log in first."); return; }
+    try {
+      const model = bestModel || "linear";
+      const data = await api.featuresCompare(token, {
+        geo: geography,
+        start: Number(startYear),
+        end: Number(endYear),
+        model,
+      });
+      setFeaturesBundle(data);
+      console.log("features/compare", data);
+    } catch (e) {
+      console.error(e);
+      setMessage(`Features error: ${e.message}`);
     }
   };
 
@@ -252,6 +291,32 @@ export default function PopulationDashboard() {
       { label: bestSeries.label, values: bestSeries.values },
     ]);
   }, [bestSeries]);
+
+  // Feature charts (ACS, FRED, BLS)
+  const FeatureChart = ({ title, s }) => {
+    if (!s) return null;
+    const labels = s.years;
+    const data = {
+      labels,
+      datasets: [
+        { label: `${s.code} (actual)`, data: s.actual, spanGaps: true, tension: 0.2, pointRadius: 2, borderWidth: 2 },
+        { label: `${s.code} (projected)`, data: s.projected, spanGaps: true, tension: 0.2, pointRadius: 2, borderDash: [6,4], borderWidth: 2 },
+      ],
+    };
+    return (
+      <div className="card">
+        <div className="card-body">
+          <div className="h3">{title}</div>
+          <Line data={data} options={{
+            responsive: true,
+            plugins: { legend: { position: "bottom" } },
+            interaction: { mode: "index", intersect: false },
+            scales: { x: { title: { display:true, text:"Year" } } }
+          }} />
+        </div>
+      </div>
+    );
+  };
 
   // For downloads
 const handleDownloadAllModels = async () => {
@@ -435,6 +500,63 @@ const handleDownloadAllModels = async () => {
           </div>
         </div>
       </section>
+
+      {/* FEATURES (ACS/BLS/CPI) */}
+      <section className="section">
+        <div className="h2">Features</div>
+        {!featuresBundle ? (
+          <div className="muted">Run “Fetch Predictions” to populate features, or add a button to fetch them.</div>
+        ) : (
+          <>
+            {/* ACS chart: both ACS1 and ACS5 on one plot */}
+            {(() => {
+            const s1 = featuresBundle.series.find(s => s.code === "ACS1_TOTAL_POP");
+            const s5 = featuresBundle.series.find(s => s.code === "ACS5_TOTAL_POP");
+            const sp = featuresBundle.series.find(s => s.code === "POPULATION_IMPLIED"); // <-- NEW
+
+            const labels = s1?.years || s5?.years || sp?.years || [];
+            const datasets = [
+              { label: "ACS1_TOTAL_POP (actual)", data: s1?.actual ?? [], spanGaps: true, tension: 0.2, pointRadius: 2, borderWidth: 2 },
+              { label: "ACS5_TOTAL_POP (actual)", data: s5?.actual ?? [], spanGaps: true, tension: 0.2, pointRadius: 2, borderWidth: 2 },
+            ];
+
+            if (sp) {
+              datasets.push({
+                label: "Population (projected)",
+                data: sp.projected,
+                spanGaps: true,
+                tension: 0.2,
+                pointRadius: 2,
+                borderWidth: 2,
+                borderDash: [6, 4],           // dotted
+              });
+            }
+
+            const data = { labels, datasets };
+            return (
+              <div className="card">
+                <div className="card-body">
+                  <div className="h3">ACS Population (1-year vs 5-year)</div>
+                  <Line data={data} options={{
+                    responsive: true,
+                    plugins: { legend: { position: "bottom" } },
+                    interaction: { mode: "index", intersect: false },
+                    scales: { x: { title: { display: true, text: "Year" } }, y: { title: { display: true, text: "Population" } } }
+                  }} />
+                </div>
+              </div>
+            );
+          })()}
+
+            {/* BLS Unemployment (actual + projected) */}
+            <FeatureChart title="BLS Unemployment Rate" s={featuresBundle.series.find(s => s.code==="BLS_UNRATE")} />
+
+            {/* CPI Shelter (actual + projected) */}
+            <FeatureChart title="CPI Shelter Index" s={featuresBundle.series.find(s => s.code==="CPI_SHELTER")} />
+          </>
+        )}
+      </section>
+
     </div>
   );
 }

@@ -11,7 +11,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import text
+from sqlalchemy import text, bindparam
 from sqlalchemy.engine import Engine
 from ppp_common.orm import engine as shared_engine
 from prophet.serialize import model_from_json
@@ -818,6 +818,124 @@ Generated: {dt.datetime.utcnow().isoformat()}Z
         headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
 
+# --- indicator compare: ACS (1 & 5), BLS_UNRATE, CPI_SHELTER ---
+@app.get("/features/compare", dependencies=[Depends(_require_auth)], tags=["features"])
+def features_compare(geo: str, start: int, end: int, model: str = "linear"):
+    """
+    Returns, for the requested geo/range:
+      - ACS1_TOTAL_POP (actuals only)
+      - ACS5_TOTAL_POP (actuals only)
+      - BLS_UNRATE     (actuals + projected)
+      - CPI_SHELTER    (actuals + projected)
+    'projected' for BLS/CPI comes from the same roll-forward logic you use for predictions:
+    hold exogenous flat at last observation and recompute lags/ma for future years.
+    """
+    if start > end:
+        raise HTTPException(status_code=400, detail="start must be <= end")
+
+    # 1) pull actuals from indicator_values for the 4 codes
+    codes = ("ACS1_TOTAL_POP", "ACS5_TOTAL_POP", "BLS_UNRATE", "CPI_SHELTER")
+
+    q = text("""
+    select year, indicator_code, value::double precision as value
+    from core.indicator_values
+    where geo_code = :g
+        and indicator_code IN :codes
+        and year between :y0 and :y1
+    order by year
+    """).bindparams(bindparam("codes", expanding=True))
+
+    df = pd.read_sql_query(
+        q,
+        _get_engine(),
+        params={"g": geo, "codes": tuple(codes), "y0": int(start), "y1": int(end)}, # type: ignore
+    )
+
+    # Normalize into dicts: {code: {year: value}}
+    actual_by_code: Dict[str, Dict[int, float | None]] = {c: {} for c in codes}
+    for _, r in df.iterrows():
+        actual_by_code[str(r["indicator_code"])][int(r["year"])] = None if pd.isna(r["value"]) else float(r["value"])
+
+    # 2) build projected series for BLS_UNRATE & CPI_SHELTER using your roll-forward
+    projections: Dict[str, Dict[int, float]] = {"BLS_UNRATE": {}, "CPI_SHELTER": {}}
+    if end > start:
+        # we need the estimator + feature order to generate future feature rows
+        key = f"{model.lower()}_{geo}"
+        m = MODEL_REGISTRY.get(key)
+        if m is None and model.lower() != "prophet":
+            # fall back to any available estimator for this geo, or skip projection
+            for fallback in ("ridge", "xgb", "linear"):
+                mk = f"{fallback}_{geo}"
+                if mk in MODEL_REGISTRY: 
+                    m, model = MODEL_REGISTRY[mk], fallback
+                    break
+        if m is not None and model.lower() != "prophet":
+            estimator = m.get("model") if isinstance(m, dict) else m
+            if estimator is not None and hasattr(estimator, "predict"):
+                # base DF covering up through last covered year (we only need for feature context)
+                df_base = _fetch_features_window(geo, start, min(end, start + 1000))  # generous cap
+                if not df_base.empty:
+                    # rename + feature order like training
+                    X_all = df_base.copy()
+                    if isinstance(m, dict) and m.get("rename_map"):
+                        X_all = X_all.rename(columns=m["rename_map"])
+                    # pick a feature order
+                    feat_art = (m.get("features") if isinstance(m, dict) else None)
+                    feat_model = getattr(estimator, "feature_names_in_", None)
+                    feature_order: List[str] = (
+                        _as_list(feat_art) or _as_list(feat_model) or [c for c in X_all.columns if c not in ("geo_code","year")]
+                    )
+                    max_cov_year = int(df_base["year"].max())
+                    # only project if user asked beyond coverage
+                    if end > max_cov_year:
+                        future_rows = _future_feature_rows_for_download(
+                            estimator=estimator,
+                            df_base=df_base,
+                            feature_order=feature_order,
+                            start_next=max_cov_year + 1,
+                            end_year=end,
+                            use_delta=bool(m.get("use_delta")) if isinstance(m, dict) else False,
+                        )
+                        # map feature columns to indicator codes
+                        col_map = {"unemployment_rate": "BLS_UNRATE", "rent_cpi_index": "CPI_SHELTER"}
+                        for col, code in col_map.items():
+                            if col in future_rows.columns:
+                                for _, r in future_rows.iterrows():
+                                    projections[code][int(r["year"])] = float(r[col])
+
+                        #future population estimates
+                        pop_proj: Dict[int, float] = {}
+                        if not future_rows.empty and "population_implied" in future_rows.columns:
+                            for _, r in future_rows.iterrows():
+                                y = int(r["year"])
+                                v = r["population_implied"]
+                                if pd.notna(v):
+                                    pop_proj[y] = float(v)
+
+    # 3) shape response across the full [start, end] range
+    years = list(range(int(start), int(end) + 1))
+    def series_for(code: str, include_projection: bool) -> Dict[str, Any]:
+        actual = [actual_by_code.get(code, {}).get(y, None) for y in years]
+        projected = [projections.get(code, {}).get(y, None) if include_projection else None for y in years]
+        return {"code": code, "years": years, "actual": actual, "projected": projected}
+
+    def series_pop_projected() -> Dict[str, Any]:
+        projected = [pop_proj.get(y, None) for y in years]
+        return {"code": "POPULATION_IMPLIED", "years": years, "actual": [None]*len(years), "projected": projected}
+
+    return {
+        "geography": geo,
+        "start": start,
+        "end": end,
+        "model_for_projection": model,
+        "series": [
+            series_for("ACS1_TOTAL_POP", include_projection=False),
+            series_for("ACS5_TOTAL_POP", include_projection=False),
+            series_for("BLS_UNRATE",     include_projection=True),
+            series_for("CPI_SHELTER",    include_projection=True),
+            series_pop_projected(),   # <-- NEW
+        ],
+    }
 
 def run():
     import uvicorn
