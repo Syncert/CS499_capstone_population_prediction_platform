@@ -253,6 +253,47 @@ export default function PopulationDashboard() {
     ]);
   }, [bestSeries]);
 
+  // For downloads
+const handleDownloadAllModels = async () => {
+  try {
+    if (!loggedIn || !geography) return;
+
+    const params = new URLSearchParams({
+      geo: String(geography),
+      start: String(startYear),
+      end: String(endYear),
+      model: "all",
+      include_future: "1"
+    });
+
+    const base = apiBase.trim().replace(/\/+$/, "");
+    const url  = `${base}/download/bundle?${params.toString()}`;
+    console.log("fetching", url);
+
+    const res = await fetch(url, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      console.error("download error:", await res.text());
+      return;
+    }
+
+    const blob = await res.blob();
+    const href = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = href;
+    a.download = `ppp_${geography}_ALL_${startYear}-${endYear}.zip`; // filename matches "all"
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(href);
+  } catch (err) {
+    console.error("download exception:", err);
+  }
+};
+
+
   // ─────────────────────────────────────────────────────────────
   // RENDER
   // ─────────────────────────────────────────────────────────────
@@ -311,6 +352,13 @@ export default function PopulationDashboard() {
                   </button>
                   <button onClick={clearAll}>Clear</button>
                   <div className="muted">{message}</div>
+                  <button
+                      onClick={handleDownloadAllModels}
+                      disabled={!bestModel || !loggedIn}
+                      title="Download indicators + feature matrix + predictions as a ZIP"
+                    >
+                      Download data bundle (.zip)
+                  </button>
                 </div>
               </div>
             </div>
