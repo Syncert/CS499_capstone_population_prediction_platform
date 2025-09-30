@@ -21,3 +21,6 @@ models/**/prophet_model_*.json
 models/**/linear_*.pkl
 models/**/ridge_*.pkl
 models/**/xgb_*.pkl
+
+#node modules
+ui/node_modules/*
