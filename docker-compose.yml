@@ -1,7 +1,10 @@
+version: "3.9"
+
 services:
   db:
     image: postgres:16
     container_name: popdb
+    env_file: .env
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -10,18 +13,19 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./db/init:/docker-entrypoint-initdb.d:ro   # runs *.sql on first start
+      - ./db/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
 
   api:
-    # IMPORTANT: build from repo root so Docker sees pyproject.toml + src/
+    image: ppp-app:latest
     build:
       context: .
-      dockerfile: api/Dockerfile
+      dockerfile: api/Dockerfile    # installs .[api,etl,ml], sets USER appuser
     container_name: popapi
     env_file: .env
     environment:
@@ -31,12 +35,9 @@ services:
         condition: service_healthy
     ports:
       - "${API_PORT:-8000}:8000"
-    # Dev-only hot reload: mount *src* (not api/app) and point uvicorn at the package
+    # mount artifacts only if you want them persisted/visible on host
     volumes:
-      - ./src:/app/src
-      - ./models:/app/models:ro
-    command: uvicorn ppp_api.main:app --host 0.0.0.0 --port 8000 --reload
-    # For production, drop volumes+command and keep the Dockerfile's CM
+      - ./artifacts:/app/artifacts
     healthcheck:
       test:
         [
@@ -46,58 +47,20 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 20s   # give uvicorn & model loading breathing room
+      start_period: 20s
     restart: unless-stopped
-    logging:
-      driver: json-file
-      options: { max-size: "10m", max-file: "3" }
-    user: "${UID}:${GID}"
-
-
-  etl:
-    # Optional worker that installs the [etl] extra and runs a module
-    build:
-      context: .
-      dockerfile: etl/Dockerfile
-    container_name: popetl
-    env_file: .env
-    volumes:
-      - ./artifacts:/app/artifacts  # host ./artifacts <-> /app/artifacts
-    environment:
-      DB_HOST: db
-      RUN_ACS: "1"
-      RUN_LAUS: "1"
-      RUN_FRED: "1"
-    depends_on:
-      db:
-        condition: service_healthy
-    # run your sample job; swap in your real module when ready
-    command: python -m ppp_etl.jobs.sample_census_ingest
-    profiles: ["etl"]    # run with: docker compose --profile etl up
-    restart: "no"         # one-shot job (keeps logs clean); change if you schedule it
-    logging:
-      driver: json-file
-      options: { max-size: "10m", max-file: "3" }
-    user: "${UID}:${GID}"
-
 
   ui:
-    image: node:20-alpine
+    build:
+      context: ./ui
+      dockerfile: Dockerfile        # multi-stage → nginx
     container_name: ppui
-    working_dir: /app
-    ports:
-      - "5173:5173"
-    volumes:
-      - ./ui:/app
-      - ui_node:/app/node_modules
     depends_on:
       api:
         condition: service_healthy
-    command: >
-      sh -lc "npm install --no-fund --no-audit
-      && npm run dev -- --host 0.0.0.0"
-
+    ports:
+      - "80:80"
+    restart: unless-stopped
 
 volumes:
   pgdata:
-  ui_node:
