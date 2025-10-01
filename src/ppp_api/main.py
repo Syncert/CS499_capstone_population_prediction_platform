@@ -696,28 +696,31 @@ def actuals(geo: str, start: int, end: int):
 def scorecard(geo: str):
     q = text("""
                 WITH scored AS (
-                SELECT r.geo_code, r.model, r.run_id, r.trained_at,
-                        h.rmse_test, h.mae_test, h.r2_test
+                SELECT r.geo_code,
+                        r.model,
+                        r.run_id,
+                        r.trained_at,
+                        h.rmse_test,
+                        h.mae_test,
+                        h.r2_test
                 FROM ml.model_runs r
                 LEFT JOIN ml.model_headline h USING (run_id)
                 WHERE r.geo_code = :g
                 ),
-                best_per_model AS (
+                recent_per_model AS (
                 SELECT *,
                         ROW_NUMBER() OVER (
                         PARTITION BY geo_code, model
-                        ORDER BY rmse_test ASC NULLS LAST, trained_at DESC
-                        ) AS rwm
+                        ORDER BY trained_at DESC, run_id DESC  -- newest run for each model
+                        ) AS rn
                 FROM scored
-                ),
-                picked AS (
-                SELECT * FROM best_per_model WHERE rwm = 1
                 )
                 SELECT *,
                     ROW_NUMBER() OVER (
                         ORDER BY rmse_test ASC NULLS LAST, trained_at DESC
                     ) AS rank_within_geo_code
-                FROM picked
+                FROM recent_per_model
+                WHERE rn = 1
                 ORDER BY rank_within_geo_code;
     """)
     df = pd.read_sql_query(q, _get_engine(), params={"g": geo})
