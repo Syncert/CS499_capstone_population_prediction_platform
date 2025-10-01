@@ -193,11 +193,33 @@ def _roll_forward_predict(
     use_delta: bool = False,
     return_rows: bool = False,
 ):
+    """
+    Roll population forward year-by-year using the trained estimator, while:
+      - projecting exogenous features (unemployment_rate, rent_cpi_index),
+      - blending model output with a recent-population CAGR baseline,
+      - clamping extreme year-over-year changes.
+
+    Tunables are grouped near the top for easy tweaking.
+    """
+    import numpy as np
+
+    # ── Tunables ──────────────────────────────────────────────────────────────
+    K_LOOKBACK = 5         # years for recent CAGR / delta stats
+    BLEND_W    = 0.70      # weight on model vs baseline (0..1); higher = trust model more
+    CLAMP_SIG  = 2.0       # clamp y/y delta within mean ± N * std from recent history
+    # Unemployment mean-reversion
+    UNRATE_TARGET = 4.5    # long-run target (%)
+    UNRATE_DECAY  = 0.50   # per-year reversion (0=no move, 1=jump to target)
+    UNRATE_MIN, UNRATE_MAX = 2.0, 15.0
+    # CPI (index) growth: blend of recent CAGR and a target inflation (e.g., 2.5%)
+    CPI_G_TARGET = 0.025
+    CPI_ALPHA    = 0.60    # weight on recent CPI CAGR vs target
+    # ──────────────────────────────────────────────────────────────────────────
+
     rows = hist_df.copy().sort_values("year").reset_index(drop=True)
     collected: list[dict] = []
 
     def last_num(col: str, default: float = 0.0) -> float:
-        """Return the last numeric value for column `col` in `rows`, else `default`."""
         if col in rows.columns:
             s = pd.to_numeric(rows[col], errors="coerce").dropna()
             if not s.empty:
@@ -205,7 +227,6 @@ def _roll_forward_predict(
         return float(default)
 
     def get_pop(yr: int) -> float | None:
-        """Return population for a given year from `rows`, if present."""
         if "population" not in rows.columns:
             return None
         s = pd.to_numeric(
@@ -214,20 +235,54 @@ def _roll_forward_predict(
         ).dropna()
         return float(s.iloc[0]) if not s.empty else None
 
+    # ── Baseline stats from recent history (population CAGR & delta band) ─────
+    hist_pop_series = pd.to_numeric(rows.get("population", pd.Series(dtype="float64")),
+                                    errors="coerce").dropna()
+    if len(hist_pop_series) >= 2:
+        last_vals = hist_pop_series.tail(min(K_LOOKBACK + 1, len(hist_pop_series)))
+        v0, v1 = float(last_vals.iloc[0]), float(last_vals.iloc[-1])
+        steps = len(last_vals) - 1
+        pop_cagr = ((v1 / v0) ** (1.0 / steps) - 1.0) if (v0 > 0 and steps > 0) else 0.0
+
+        deltas = last_vals.diff().dropna().to_numpy(dtype="float64")
+        d_mean = float(np.mean(deltas)) if deltas.size else 0.0
+        d_std  = float(np.std(deltas))  if deltas.size else 0.0
+    else:
+        pop_cagr, d_mean, d_std = 0.0, 0.0, 0.0
+
+    # ── CPI recent CAGR (on the index) for a gentle projection ────────────────
+    cpi_hist = pd.to_numeric(rows.get("rent_cpi_index", pd.Series(dtype="float64")),
+                             errors="coerce").dropna()
+    if len(cpi_hist) >= 2:
+        cpi_tail = cpi_hist.tail(min(K_LOOKBACK + 1, len(cpi_hist)))
+        c0, c1 = float(cpi_tail.iloc[0]), float(cpi_tail.iloc[-1])
+        steps_c = len(cpi_tail) - 1
+        cpi_cagr_recent = ((c1 / c0) ** (1.0 / steps_c) - 1.0) if (c0 > 0 and steps_c > 0) else CPI_G_TARGET
+    else:
+        cpi_cagr_recent = CPI_G_TARGET
+
     years_out: List[int] = []
     preds_out: List[float] = []
 
     for y in range(int(start_next_year), int(end_year) + 1):
-        # exogenous (held flat at last observed)
-        unrate = last_num("unemployment_rate", 0.0)
-        rent_cpi = last_num("rent_cpi_index", 0.0)
+        # ── 1) Project exogenous drivers for year y ───────────────────────────
+        # Unemployment: mean-revert toward target
+        u_prev = last_num("unemployment_rate", UNRATE_TARGET)
+        unrate = UNRATE_TARGET + (u_prev - UNRATE_TARGET) * (1.0 - UNRATE_DECAY)
+        unrate = float(max(UNRATE_MIN, min(UNRATE_MAX, unrate)))
 
-        # lags / moving average from history (actuals + prior yhat)
+        # CPI shelter index: blend recent CAGR with target inflation
+        c_prev = last_num("rent_cpi_index", 0.0)
+        g_cpi  = float(CPI_ALPHA * cpi_cagr_recent + (1.0 - CPI_ALPHA) * CPI_G_TARGET)
+        rent_cpi = float(c_prev * (1.0 + g_cpi)) if c_prev > 0 else c_prev
+
+        # Lags / moving average using history (actual + prior predictions)
         lag1 = get_pop(y - 1)
         lag5 = get_pop(y - 5)
         ma_vals = [v for v in (get_pop(y - 2), get_pop(y - 1)) if v is not None]
         ma3 = (sum(ma_vals) / len(ma_vals)) if ma_vals else last_num("population", 0.0)
 
+        # ── 2) Assemble features in *training order* ──────────────────────────
         feat_row: List[float] = []
         feat_map: dict = {}
 
@@ -250,38 +305,55 @@ def _roll_forward_predict(
                 v = 0.0
             else:
                 v = last_num(c, 0.0)
-
             feat_row.append(v)
             feat_map[c] = v
 
         X_next = pd.DataFrame([feat_row], columns=feature_cols).astype("float64")
+
+        # ── 3) Model prediction for year y ────────────────────────────────────
         try:
             yhat_raw = float(estimator.predict(X_next.to_numpy(copy=False))[0])
         except Exception:
             yhat_raw = float(estimator.predict(X_next)[0])
 
         base_next = float(lag1) if (use_delta and lag1 is not None) else 0.0
-        yhat_level = yhat_raw + base_next if use_delta else yhat_raw
+        model_level = yhat_raw + base_next if use_delta else yhat_raw
+
+        # ── 4) Blend with baseline trend & clamp to sane YoY change ──────────
+        if lag1 is not None and lag1 > 0:
+            baseline_next = float(lag1 * (1.0 + pop_cagr))
+            blended = float(BLEND_W * model_level + (1.0 - BLEND_W) * baseline_next)
+
+            if d_std > 0:
+                lo = d_mean - CLAMP_SIG * d_std
+                hi = d_mean + CLAMP_SIG * d_std
+                delta = blended - float(lag1)
+                delta = min(hi, max(lo, delta))
+                yhat_level = float(lag1 + delta)
+            else:
+                # no delta stats: softly clamp to ±5% if needed
+                soft = 0.05
+                yhat_level = float(max(lag1 * (1 - soft), min(lag1 * (1 + soft), blended)))
+        else:
+            yhat_level = model_level
 
         years_out.append(int(y))
         preds_out.append(yhat_level)
 
-        # append to history for subsequent steps
+        # ── 5) Append the new year to history for subsequent steps ────────────
         rows = pd.concat(
             [
                 rows,
                 pd.DataFrame(
-                    [
-                        {
-                            "year": int(y),
-                            "population": yhat_level,
-                            "unemployment_rate": unrate,
-                            "rent_cpi_index": rent_cpi,
-                            "pop_lag1": lag1 if lag1 is not None else 0.0,
-                            "pop_lag5": lag5 if lag5 is not None else 0.0,
-                            "pop_ma3": ma3,
-                        }
-                    ]
+                    [{
+                        "year": int(y),
+                        "population": yhat_level,
+                        "unemployment_rate": unrate,
+                        "rent_cpi_index": rent_cpi,
+                        "pop_lag1": lag1 if lag1 is not None else 0.0,
+                        "pop_lag5": lag5 if lag5 is not None else 0.0,
+                        "pop_ma3": ma3,
+                    }]
                 ),
             ],
             ignore_index=True,
@@ -292,13 +364,33 @@ def _roll_forward_predict(
             feat_map["population_implied"] = yhat_level
             collected.append(feat_map)
 
+        # refresh “recent” stats slowly as we extend
+        # (keeps the clamp/baseline responsive but stable)
+        hist_pop_series = pd.to_numeric(rows["population"], errors="coerce").dropna()
+        if len(hist_pop_series) >= 2:
+            tail = hist_pop_series.tail(min(K_LOOKBACK + 1, len(hist_pop_series)))
+            v0, v1 = float(tail.iloc[0]), float(tail.iloc[-1])
+            steps = len(tail) - 1
+            pop_cagr = ((v1 / v0) ** (1.0 / steps) - 1.0) if (v0 > 0 and steps > 0) else pop_cagr
+
+            deltas = tail.diff().dropna().to_numpy(dtype="float64")
+            d_mean = float(np.mean(deltas)) if deltas.size else d_mean
+            d_std  = float(np.std(deltas))  if deltas.size else d_std
+
+        cpi_hist = pd.to_numeric(rows["rent_cpi_index"], errors="coerce").dropna()
+        if len(cpi_hist) >= 2:
+            ctail = cpi_hist.tail(min(K_LOOKBACK + 1, len(cpi_hist)))
+            c0, c1 = float(ctail.iloc[0]), float(ctail.iloc[-1])
+            steps_c = len(ctail) - 1
+            if c0 > 0 and steps_c > 0:
+                cpi_cagr_recent = ((c1 / c0) ** (1.0 / steps_c) - 1.0)
+
     if return_rows:
         cols = ["year"] + [c for c in feature_cols if c != "year"] + ["population_implied"]
         future_df = pd.DataFrame(collected)[cols] if collected else pd.DataFrame(columns=cols)
         return years_out, preds_out, future_df
 
     return years_out, preds_out
-
 
 
 def _predict(model_name: str, X: pd.DataFrame) -> List[float]:
