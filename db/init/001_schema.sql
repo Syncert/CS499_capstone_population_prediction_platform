@@ -172,8 +172,8 @@ WHERE f.has_full_features
 ORDER BY f.geo_code, f.year;
 
 -- Helpful indexes
-CREATE INDEX IF NOT EXISTS feature_matrix_geo_year_idx ON ml.feature_matrix (geo_code, year);
-CREATE INDEX IF NOT EXISTS feature_matrix_year_geo_idx ON ml.feature_matrix (year, geo_code);
+CREATE UNIQUE INDEX IF NOT EXISTS feature_matrix_uq
+  ON ml.feature_matrix (geo_code, year);
 
 -- ─────────────────────────────────────────────────────────
 -- object: ml.model_artifacts (TABLE)

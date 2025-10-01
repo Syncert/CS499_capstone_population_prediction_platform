@@ -3,6 +3,10 @@ COMPOSE := docker compose --env-file .env
 API := $(COMPOSE) exec -T api
 DB  := $(COMPOSE) exec -T db
 
+refresh-feature-matrix:  ## Refresh ml.feature_matrix (tries CONCURRENTLY, falls back)
+	@$(DB) sh -lc 'psql -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "REFRESH MATERIALIZED VIEW CONCURRENTLY ml.feature_matrix;" \
+	  || psql -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -c "REFRESH MATERIALIZED VIEW ml.feature_matrix;"'
+
 up:        ## Build & start
 	$(COMPOSE) up -d --build
 down:      ## Stop
@@ -19,6 +23,7 @@ etl-all:   ## Run all ETL jobs
 	$(API) ppp-etl-acs-pop
 	$(API) ppp-etl-bls-laus
 	$(API) ppp-etl-fred-cpi
+	$(MAKE) refresh-feature-matrix
 
 train:     ## Train all geos/models (drift-aware)
 	$(API) ppp-ml-train-all-models --min-years 8 --split-year 2020 --horizon 10
@@ -34,7 +39,7 @@ bootstrap: ## Fresh start -> ETL -> train -> smoke test
 	$(COMPOSE) up -d --build
 	$(MAKE) wait-db
 	$(MAKE) etl-all
-	$(MAKE) train
+	$(MAKE) train-force
 	@curl -sf http://localhost:$${API_PORT:-8000}/health >/dev/null && echo "API healthy ✅"
 
 # ───────── CRON helpers (host) ─────────
