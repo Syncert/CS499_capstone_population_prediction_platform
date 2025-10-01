@@ -18,7 +18,9 @@ import GeoPickers from "./GeoPickers.jsx";
 //    each selected model. It renders a multi-series line chart comparing forecasts.
 // ----------------------------------------------------------------------------
 
-const API_BASE_DEFAULT = "http://localhost:8000";
+// const API_BASE_DEFAULT = "http://localhost:8000"; //dev
+const API_BASE_DEFAULT = "/api"; //prod, nginx docker environment
+
 const ALL_MODELS = ["linear", "ridge", "xgb", "prophet"]; // toggle per your training
 
 function useApi(baseUrl) {

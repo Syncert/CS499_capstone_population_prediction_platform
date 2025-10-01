@@ -380,9 +380,7 @@ app = FastAPI(title=API_TITLE, version=API_VERSION)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5173",   # dev browser
-        "http://127.0.0.1:5173",
-        "http://ui:5173"           # container-to-container, just in case
+        "http://localhost"        # production setup
     ],
     allow_methods=["*"],
     allow_headers=["*"],
@@ -823,70 +821,101 @@ Generated: {dt.datetime.utcnow().isoformat()}Z
 def features_compare(geo: str, start: int, end: int, model: str = "linear"):
     """
     Returns, for the requested geo/range:
-      - ACS1_TOTAL_POP (actuals only)
-      - ACS5_TOTAL_POP (actuals only)
-      - BLS_UNRATE     (actuals + projected)
-      - CPI_SHELTER    (actuals + projected)
+      - ACS1_TOTAL_POP (actuals only, from core.indicator_values)
+      - ACS5_TOTAL_POP (actuals only, from core.indicator_values)
+      - BLS_UNRATE     (actuals from feature_matrix + projected)
+      - CPI_SHELTER    (actuals from feature_matrix + projected)
+
     'projected' for BLS/CPI comes from the same roll-forward logic you use for predictions:
     hold exogenous flat at last observation and recompute lags/ma for future years.
     """
     if start > end:
         raise HTTPException(status_code=400, detail="start must be <= end")
 
-    # 1) pull actuals from indicator_values for the 4 codes
-    codes = ("ACS1_TOTAL_POP", "ACS5_TOTAL_POP", "BLS_UNRATE", "CPI_SHELTER")
+    years = list(range(int(start), int(end) + 1))
 
+    # -------------------------
+    # 1) ACS actuals from indicator_values
+    # -------------------------
+    acs_codes = ("ACS1_TOTAL_POP", "ACS5_TOTAL_POP")
     q = text("""
-    select year, indicator_code, value::double precision as value
-    from core.indicator_values
-    where geo_code = :g
-        and indicator_code IN :codes
-        and year between :y0 and :y1
-    order by year
+        select year, indicator_code, value::double precision as value
+          from core.indicator_values
+         where geo_code = :g
+           and indicator_code in :codes
+           and year between :y0 and :y1
+         order by year
     """).bindparams(bindparam("codes", expanding=True))
 
-    df = pd.read_sql_query(
+    df_acs = pd.read_sql_query(
         q,
         _get_engine(),
-        params={"g": geo, "codes": tuple(codes), "y0": int(start), "y1": int(end)}, # type: ignore
+        params={"g": geo, "codes": tuple(acs_codes), "y0": int(start), "y1": int(end)},  # type: ignore
     )
 
-    # Normalize into dicts: {code: {year: value}}
-    actual_by_code: Dict[str, Dict[int, float | None]] = {c: {} for c in codes}
-    for _, r in df.iterrows():
-        actual_by_code[str(r["indicator_code"])][int(r["year"])] = None if pd.isna(r["value"]) else float(r["value"])
+    # {code: {year: value}}
+    actual_by_code: Dict[str, Dict[int, float | None]] = {c: {} for c in acs_codes}
+    for _, r in df_acs.iterrows():
+        actual_by_code[str(r["indicator_code"])][int(r["year"])] = (
+            None if pd.isna(r["value"]) else float(r["value"])
+        )
+    
+    # -------------------------
+    # 2) BLS/CPI actuals from feature_matrix (names as used in training)
+    # -------------------------
+    fm = _fetch_features_window(geo, start, end)  # ml.feature_matrix
+    bls_col = "unemployment_rate"
+    cpi_col = "rent_cpi_index"
 
-    # 2) build projected series for BLS_UNRATE & CPI_SHELTER using your roll-forward
+    # Ensure keys exist even if fm is empty
+    actual_by_code["BLS_UNRATE"] = {}
+    actual_by_code["CPI_SHELTER"] = {}
+
+    if not fm.empty:
+        if bls_col in fm.columns:
+            actual_by_code["BLS_UNRATE"] = {
+                int(y): (None if pd.isna(v) else float(v))
+                for y, v in zip(fm["year"].astype(int), fm[bls_col])
+            }
+        if cpi_col in fm.columns:
+            actual_by_code["CPI_SHELTER"] = {
+                int(y): (None if pd.isna(v) else float(v))
+                for y, v in zip(fm["year"].astype(int), fm[cpi_col])
+            }
+
+    # -------------------------
+    # 3) Build projected series for BLS/CPI using your roll-forward
+    # -------------------------
     projections: Dict[str, Dict[int, float]] = {"BLS_UNRATE": {}, "CPI_SHELTER": {}}
+    pop_proj: Dict[int, float] = {}
+
     if end > start:
-        # we need the estimator + feature order to generate future feature rows
         key = f"{model.lower()}_{geo}"
         m = MODEL_REGISTRY.get(key)
         if m is None and model.lower() != "prophet":
-            # fall back to any available estimator for this geo, or skip projection
             for fallback in ("ridge", "xgb", "linear"):
                 mk = f"{fallback}_{geo}"
-                if mk in MODEL_REGISTRY: 
+                if mk in MODEL_REGISTRY:
                     m, model = MODEL_REGISTRY[mk], fallback
                     break
+
         if m is not None and model.lower() != "prophet":
             estimator = m.get("model") if isinstance(m, dict) else m
             if estimator is not None and hasattr(estimator, "predict"):
-                # base DF covering up through last covered year (we only need for feature context)
-                df_base = _fetch_features_window(geo, start, min(end, start + 1000))  # generous cap
+                df_base = _fetch_features_window(geo, start, min(end, start + 1000))
                 if not df_base.empty:
-                    # rename + feature order like training
                     X_all = df_base.copy()
                     if isinstance(m, dict) and m.get("rename_map"):
                         X_all = X_all.rename(columns=m["rename_map"])
-                    # pick a feature order
+
                     feat_art = (m.get("features") if isinstance(m, dict) else None)
                     feat_model = getattr(estimator, "feature_names_in_", None)
                     feature_order: List[str] = (
-                        _as_list(feat_art) or _as_list(feat_model) or [c for c in X_all.columns if c not in ("geo_code","year")]
+                        _as_list(feat_art) or _as_list(feat_model)
+                        or [c for c in X_all.columns if c not in ("geo_code", "year")]
                     )
+
                     max_cov_year = int(df_base["year"].max())
-                    # only project if user asked beyond coverage
                     if end > max_cov_year:
                         future_rows = _future_feature_rows_for_download(
                             estimator=estimator,
@@ -896,15 +925,14 @@ def features_compare(geo: str, start: int, end: int, model: str = "linear"):
                             end_year=end,
                             use_delta=bool(m.get("use_delta")) if isinstance(m, dict) else False,
                         )
-                        # map feature columns to indicator codes
-                        col_map = {"unemployment_rate": "BLS_UNRATE", "rent_cpi_index": "CPI_SHELTER"}
+
+                        # map feature columns to indicator codes for projections
+                        col_map = {bls_col: "BLS_UNRATE", cpi_col: "CPI_SHELTER"}
                         for col, code in col_map.items():
                             if col in future_rows.columns:
                                 for _, r in future_rows.iterrows():
                                     projections[code][int(r["year"])] = float(r[col])
 
-                        #future population estimates
-                        pop_proj: Dict[int, float] = {}
                         if not future_rows.empty and "population_implied" in future_rows.columns:
                             for _, r in future_rows.iterrows():
                                 y = int(r["year"])
@@ -912,8 +940,9 @@ def features_compare(geo: str, start: int, end: int, model: str = "linear"):
                                 if pd.notna(v):
                                     pop_proj[y] = float(v)
 
-    # 3) shape response across the full [start, end] range
-    years = list(range(int(start), int(end) + 1))
+    # -------------------------
+    # 4) Shape response across the full [start, end] range
+    # -------------------------
     def series_for(code: str, include_projection: bool) -> Dict[str, Any]:
         actual = [actual_by_code.get(code, {}).get(y, None) for y in years]
         projected = [projections.get(code, {}).get(y, None) if include_projection else None for y in years]
@@ -921,10 +950,10 @@ def features_compare(geo: str, start: int, end: int, model: str = "linear"):
 
     def series_pop_projected() -> Dict[str, Any]:
         projected = [pop_proj.get(y, None) for y in years]
-        return {"code": "POPULATION_IMPLIED", "years": years, "actual": [None]*len(years), "projected": projected}
+        return {"code": "POPULATION_IMPLIED", "years": years, "actual": [None] * len(years), "projected": projected}
 
     return {
-        "geography": geo,
+        "Geography": geo,
         "start": start,
         "end": end,
         "model_for_projection": model,
@@ -933,9 +962,10 @@ def features_compare(geo: str, start: int, end: int, model: str = "linear"):
             series_for("ACS5_TOTAL_POP", include_projection=False),
             series_for("BLS_UNRATE",     include_projection=True),
             series_for("CPI_SHELTER",    include_projection=True),
-            series_pop_projected(),   # <-- NEW
+            series_pop_projected(),
         ],
     }
+
 
 def run():
     import uvicorn

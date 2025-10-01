@@ -37,7 +37,9 @@ services:
       - "${API_PORT:-8000}:8000"
     # mount artifacts only if you want them persisted/visible on host
     volumes:
-      - ./artifacts:/app/artifacts
+      - ./artifacts:/app/artifacts # access to write artifacts
+      - ./models:/app/models   # access to models on disk
+
     healthcheck:
       test:
         [
