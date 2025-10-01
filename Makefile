@@ -26,6 +26,9 @@ train:     ## Train all geos/models (drift-aware)
 train-dry: ## Dry-run training plan
 	$(API) ppp-ml-train-all-models --dry-run
 
+train-force: ## Force retrain all geos/models (ignore drift)
+	$(API) ppp-ml-train-all-models --min-years 8 --split-year 2020 --horizon 10 --force
+
 bootstrap: ## Fresh start -> ETL -> train -> smoke test
 	$(COMPOSE) down -v
 	$(COMPOSE) up -d --build
