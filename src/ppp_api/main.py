@@ -193,11 +193,33 @@ def _roll_forward_predict(
     use_delta: bool = False,
     return_rows: bool = False,
 ):
+    """
+    Roll population forward year-by-year using the trained estimator, while:
+      - projecting exogenous features (unemployment_rate, rent_cpi_index),
+      - blending model output with a recent-population CAGR baseline,
+      - clamping extreme year-over-year changes.
+
+    Tunables are grouped near the top for easy tweaking.
+    """
+    import numpy as np
+
+    # ── Tunables ──────────────────────────────────────────────────────────────
+    K_LOOKBACK = 5         # years for recent CAGR / delta stats
+    BLEND_W    = 0.70      # weight on model vs baseline (0..1); higher = trust model more
+    CLAMP_SIG  = 2.0       # clamp y/y delta within mean ± N * std from recent history
+    # Unemployment mean-reversion
+    UNRATE_TARGET = 4.5    # long-run target (%)
+    UNRATE_DECAY  = 0.50   # per-year reversion (0=no move, 1=jump to target)
+    UNRATE_MIN, UNRATE_MAX = 2.0, 15.0
+    # CPI (index) growth: blend of recent CAGR and a target inflation (e.g., 2.5%)
+    CPI_G_TARGET = 0.025
+    CPI_ALPHA    = 0.60    # weight on recent CPI CAGR vs target
+    # ──────────────────────────────────────────────────────────────────────────
+
     rows = hist_df.copy().sort_values("year").reset_index(drop=True)
     collected: list[dict] = []
 
     def last_num(col: str, default: float = 0.0) -> float:
-        """Return the last numeric value for column `col` in `rows`, else `default`."""
         if col in rows.columns:
             s = pd.to_numeric(rows[col], errors="coerce").dropna()
             if not s.empty:
@@ -205,7 +227,6 @@ def _roll_forward_predict(
         return float(default)
 
     def get_pop(yr: int) -> float | None:
-        """Return population for a given year from `rows`, if present."""
         if "population" not in rows.columns:
             return None
         s = pd.to_numeric(
@@ -214,20 +235,54 @@ def _roll_forward_predict(
         ).dropna()
         return float(s.iloc[0]) if not s.empty else None
 
+    # ── Baseline stats from recent history (population CAGR & delta band) ─────
+    hist_pop_series = pd.to_numeric(rows.get("population", pd.Series(dtype="float64")),
+                                    errors="coerce").dropna()
+    if len(hist_pop_series) >= 2:
+        last_vals = hist_pop_series.tail(min(K_LOOKBACK + 1, len(hist_pop_series)))
+        v0, v1 = float(last_vals.iloc[0]), float(last_vals.iloc[-1])
+        steps = len(last_vals) - 1
+        pop_cagr = ((v1 / v0) ** (1.0 / steps) - 1.0) if (v0 > 0 and steps > 0) else 0.0
+
+        deltas = last_vals.diff().dropna().to_numpy(dtype="float64")
+        d_mean = float(np.mean(deltas)) if deltas.size else 0.0
+        d_std  = float(np.std(deltas))  if deltas.size else 0.0
+    else:
+        pop_cagr, d_mean, d_std = 0.0, 0.0, 0.0
+
+    # ── CPI recent CAGR (on the index) for a gentle projection ────────────────
+    cpi_hist = pd.to_numeric(rows.get("rent_cpi_index", pd.Series(dtype="float64")),
+                             errors="coerce").dropna()
+    if len(cpi_hist) >= 2:
+        cpi_tail = cpi_hist.tail(min(K_LOOKBACK + 1, len(cpi_hist)))
+        c0, c1 = float(cpi_tail.iloc[0]), float(cpi_tail.iloc[-1])
+        steps_c = len(cpi_tail) - 1
+        cpi_cagr_recent = ((c1 / c0) ** (1.0 / steps_c) - 1.0) if (c0 > 0 and steps_c > 0) else CPI_G_TARGET
+    else:
+        cpi_cagr_recent = CPI_G_TARGET
+
     years_out: List[int] = []
     preds_out: List[float] = []
 
     for y in range(int(start_next_year), int(end_year) + 1):
-        # exogenous (held flat at last observed)
-        unrate = last_num("unemployment_rate", 0.0)
-        rent_cpi = last_num("rent_cpi_index", 0.0)
+        # ── 1) Project exogenous drivers for year y ───────────────────────────
+        # Unemployment: mean-revert toward target
+        u_prev = last_num("unemployment_rate", UNRATE_TARGET)
+        unrate = UNRATE_TARGET + (u_prev - UNRATE_TARGET) * (1.0 - UNRATE_DECAY)
+        unrate = float(max(UNRATE_MIN, min(UNRATE_MAX, unrate)))
 
-        # lags / moving average from history (actuals + prior yhat)
+        # CPI shelter index: blend recent CAGR with target inflation
+        c_prev = last_num("rent_cpi_index", 0.0)
+        g_cpi  = float(CPI_ALPHA * cpi_cagr_recent + (1.0 - CPI_ALPHA) * CPI_G_TARGET)
+        rent_cpi = float(c_prev * (1.0 + g_cpi)) if c_prev > 0 else c_prev
+
+        # Lags / moving average using history (actual + prior predictions)
         lag1 = get_pop(y - 1)
         lag5 = get_pop(y - 5)
         ma_vals = [v for v in (get_pop(y - 2), get_pop(y - 1)) if v is not None]
         ma3 = (sum(ma_vals) / len(ma_vals)) if ma_vals else last_num("population", 0.0)
 
+        # ── 2) Assemble features in *training order* ──────────────────────────
         feat_row: List[float] = []
         feat_map: dict = {}
 
@@ -250,38 +305,55 @@ def _roll_forward_predict(
                 v = 0.0
             else:
                 v = last_num(c, 0.0)
-
             feat_row.append(v)
             feat_map[c] = v
 
         X_next = pd.DataFrame([feat_row], columns=feature_cols).astype("float64")
+
+        # ── 3) Model prediction for year y ────────────────────────────────────
         try:
             yhat_raw = float(estimator.predict(X_next.to_numpy(copy=False))[0])
         except Exception:
             yhat_raw = float(estimator.predict(X_next)[0])
 
         base_next = float(lag1) if (use_delta and lag1 is not None) else 0.0
-        yhat_level = yhat_raw + base_next if use_delta else yhat_raw
+        model_level = yhat_raw + base_next if use_delta else yhat_raw
+
+        # ── 4) Blend with baseline trend & clamp to sane YoY change ──────────
+        if lag1 is not None and lag1 > 0:
+            baseline_next = float(lag1 * (1.0 + pop_cagr))
+            blended = float(BLEND_W * model_level + (1.0 - BLEND_W) * baseline_next)
+
+            if d_std > 0:
+                lo = d_mean - CLAMP_SIG * d_std
+                hi = d_mean + CLAMP_SIG * d_std
+                delta = blended - float(lag1)
+                delta = min(hi, max(lo, delta))
+                yhat_level = float(lag1 + delta)
+            else:
+                # no delta stats: softly clamp to ±5% if needed
+                soft = 0.05
+                yhat_level = float(max(lag1 * (1 - soft), min(lag1 * (1 + soft), blended)))
+        else:
+            yhat_level = model_level
 
         years_out.append(int(y))
         preds_out.append(yhat_level)
 
-        # append to history for subsequent steps
+        # ── 5) Append the new year to history for subsequent steps ────────────
         rows = pd.concat(
             [
                 rows,
                 pd.DataFrame(
-                    [
-                        {
-                            "year": int(y),
-                            "population": yhat_level,
-                            "unemployment_rate": unrate,
-                            "rent_cpi_index": rent_cpi,
-                            "pop_lag1": lag1 if lag1 is not None else 0.0,
-                            "pop_lag5": lag5 if lag5 is not None else 0.0,
-                            "pop_ma3": ma3,
-                        }
-                    ]
+                    [{
+                        "year": int(y),
+                        "population": yhat_level,
+                        "unemployment_rate": unrate,
+                        "rent_cpi_index": rent_cpi,
+                        "pop_lag1": lag1 if lag1 is not None else 0.0,
+                        "pop_lag5": lag5 if lag5 is not None else 0.0,
+                        "pop_ma3": ma3,
+                    }]
                 ),
             ],
             ignore_index=True,
@@ -292,13 +364,33 @@ def _roll_forward_predict(
             feat_map["population_implied"] = yhat_level
             collected.append(feat_map)
 
+        # refresh “recent” stats slowly as we extend
+        # (keeps the clamp/baseline responsive but stable)
+        hist_pop_series = pd.to_numeric(rows["population"], errors="coerce").dropna()
+        if len(hist_pop_series) >= 2:
+            tail = hist_pop_series.tail(min(K_LOOKBACK + 1, len(hist_pop_series)))
+            v0, v1 = float(tail.iloc[0]), float(tail.iloc[-1])
+            steps = len(tail) - 1
+            pop_cagr = ((v1 / v0) ** (1.0 / steps) - 1.0) if (v0 > 0 and steps > 0) else pop_cagr
+
+            deltas = tail.diff().dropna().to_numpy(dtype="float64")
+            d_mean = float(np.mean(deltas)) if deltas.size else d_mean
+            d_std  = float(np.std(deltas))  if deltas.size else d_std
+
+        cpi_hist = pd.to_numeric(rows["rent_cpi_index"], errors="coerce").dropna()
+        if len(cpi_hist) >= 2:
+            ctail = cpi_hist.tail(min(K_LOOKBACK + 1, len(cpi_hist)))
+            c0, c1 = float(ctail.iloc[0]), float(ctail.iloc[-1])
+            steps_c = len(ctail) - 1
+            if c0 > 0 and steps_c > 0:
+                cpi_cagr_recent = ((c1 / c0) ** (1.0 / steps_c) - 1.0)
+
     if return_rows:
         cols = ["year"] + [c for c in feature_cols if c != "year"] + ["population_implied"]
         future_df = pd.DataFrame(collected)[cols] if collected else pd.DataFrame(columns=cols)
         return years_out, preds_out, future_df
 
     return years_out, preds_out
-
 
 
 def _predict(model_name: str, X: pd.DataFrame) -> List[float]:
@@ -380,9 +472,7 @@ app = FastAPI(title=API_TITLE, version=API_VERSION)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5173",   # dev browser
-        "http://127.0.0.1:5173",
-        "http://ui:5173"           # container-to-container, just in case
+        "http://localhost"        # production setup
     ],
     allow_methods=["*"],
     allow_headers=["*"],
@@ -606,28 +696,31 @@ def actuals(geo: str, start: int, end: int):
 def scorecard(geo: str):
     q = text("""
                 WITH scored AS (
-                SELECT r.geo_code, r.model, r.run_id, r.trained_at,
-                        h.rmse_test, h.mae_test, h.r2_test
+                SELECT r.geo_code,
+                        r.model,
+                        r.run_id,
+                        r.trained_at,
+                        h.rmse_test,
+                        h.mae_test,
+                        h.r2_test
                 FROM ml.model_runs r
                 LEFT JOIN ml.model_headline h USING (run_id)
                 WHERE r.geo_code = :g
                 ),
-                best_per_model AS (
+                recent_per_model AS (
                 SELECT *,
                         ROW_NUMBER() OVER (
                         PARTITION BY geo_code, model
-                        ORDER BY rmse_test ASC NULLS LAST, trained_at DESC
-                        ) AS rwm
+                        ORDER BY trained_at DESC, run_id DESC  -- newest run for each model
+                        ) AS rn
                 FROM scored
-                ),
-                picked AS (
-                SELECT * FROM best_per_model WHERE rwm = 1
                 )
                 SELECT *,
                     ROW_NUMBER() OVER (
                         ORDER BY rmse_test ASC NULLS LAST, trained_at DESC
                     ) AS rank_within_geo_code
-                FROM picked
+                FROM recent_per_model
+                WHERE rn = 1
                 ORDER BY rank_within_geo_code;
     """)
     df = pd.read_sql_query(q, _get_engine(), params={"g": geo})
@@ -823,70 +916,101 @@ Generated: {dt.datetime.utcnow().isoformat()}Z
 def features_compare(geo: str, start: int, end: int, model: str = "linear"):
     """
     Returns, for the requested geo/range:
-      - ACS1_TOTAL_POP (actuals only)
-      - ACS5_TOTAL_POP (actuals only)
-      - BLS_UNRATE     (actuals + projected)
-      - CPI_SHELTER    (actuals + projected)
+      - ACS1_TOTAL_POP (actuals only, from core.indicator_values)
+      - ACS5_TOTAL_POP (actuals only, from core.indicator_values)
+      - BLS_UNRATE     (actuals from feature_matrix + projected)
+      - CPI_SHELTER    (actuals from feature_matrix + projected)
+
     'projected' for BLS/CPI comes from the same roll-forward logic you use for predictions:
     hold exogenous flat at last observation and recompute lags/ma for future years.
     """
     if start > end:
         raise HTTPException(status_code=400, detail="start must be <= end")
 
-    # 1) pull actuals from indicator_values for the 4 codes
-    codes = ("ACS1_TOTAL_POP", "ACS5_TOTAL_POP", "BLS_UNRATE", "CPI_SHELTER")
+    years = list(range(int(start), int(end) + 1))
 
+    # -------------------------
+    # 1) ACS actuals from indicator_values
+    # -------------------------
+    acs_codes = ("ACS1_TOTAL_POP", "ACS5_TOTAL_POP")
     q = text("""
-    select year, indicator_code, value::double precision as value
-    from core.indicator_values
-    where geo_code = :g
-        and indicator_code IN :codes
-        and year between :y0 and :y1
-    order by year
+        select year, indicator_code, value::double precision as value
+          from core.indicator_values
+         where geo_code = :g
+           and indicator_code in :codes
+           and year between :y0 and :y1
+         order by year
     """).bindparams(bindparam("codes", expanding=True))
 
-    df = pd.read_sql_query(
+    df_acs = pd.read_sql_query(
         q,
         _get_engine(),
-        params={"g": geo, "codes": tuple(codes), "y0": int(start), "y1": int(end)}, # type: ignore
+        params={"g": geo, "codes": tuple(acs_codes), "y0": int(start), "y1": int(end)},  # type: ignore
     )
 
-    # Normalize into dicts: {code: {year: value}}
-    actual_by_code: Dict[str, Dict[int, float | None]] = {c: {} for c in codes}
-    for _, r in df.iterrows():
-        actual_by_code[str(r["indicator_code"])][int(r["year"])] = None if pd.isna(r["value"]) else float(r["value"])
+    # {code: {year: value}}
+    actual_by_code: Dict[str, Dict[int, float | None]] = {c: {} for c in acs_codes}
+    for _, r in df_acs.iterrows():
+        actual_by_code[str(r["indicator_code"])][int(r["year"])] = (
+            None if pd.isna(r["value"]) else float(r["value"])
+        )
+    
+    # -------------------------
+    # 2) BLS/CPI actuals from feature_matrix (names as used in training)
+    # -------------------------
+    fm = _fetch_features_window(geo, start, end)  # ml.feature_matrix
+    bls_col = "unemployment_rate"
+    cpi_col = "rent_cpi_index"
 
-    # 2) build projected series for BLS_UNRATE & CPI_SHELTER using your roll-forward
+    # Ensure keys exist even if fm is empty
+    actual_by_code["BLS_UNRATE"] = {}
+    actual_by_code["CPI_SHELTER"] = {}
+
+    if not fm.empty:
+        if bls_col in fm.columns:
+            actual_by_code["BLS_UNRATE"] = {
+                int(y): (None if pd.isna(v) else float(v))
+                for y, v in zip(fm["year"].astype(int), fm[bls_col])
+            }
+        if cpi_col in fm.columns:
+            actual_by_code["CPI_SHELTER"] = {
+                int(y): (None if pd.isna(v) else float(v))
+                for y, v in zip(fm["year"].astype(int), fm[cpi_col])
+            }
+
+    # -------------------------
+    # 3) Build projected series for BLS/CPI using your roll-forward
+    # -------------------------
     projections: Dict[str, Dict[int, float]] = {"BLS_UNRATE": {}, "CPI_SHELTER": {}}
+    pop_proj: Dict[int, float] = {}
+
     if end > start:
-        # we need the estimator + feature order to generate future feature rows
         key = f"{model.lower()}_{geo}"
         m = MODEL_REGISTRY.get(key)
         if m is None and model.lower() != "prophet":
-            # fall back to any available estimator for this geo, or skip projection
             for fallback in ("ridge", "xgb", "linear"):
                 mk = f"{fallback}_{geo}"
-                if mk in MODEL_REGISTRY: 
+                if mk in MODEL_REGISTRY:
                     m, model = MODEL_REGISTRY[mk], fallback
                     break
+
         if m is not None and model.lower() != "prophet":
             estimator = m.get("model") if isinstance(m, dict) else m
             if estimator is not None and hasattr(estimator, "predict"):
-                # base DF covering up through last covered year (we only need for feature context)
-                df_base = _fetch_features_window(geo, start, min(end, start + 1000))  # generous cap
+                df_base = _fetch_features_window(geo, start, min(end, start + 1000))
                 if not df_base.empty:
-                    # rename + feature order like training
                     X_all = df_base.copy()
                     if isinstance(m, dict) and m.get("rename_map"):
                         X_all = X_all.rename(columns=m["rename_map"])
-                    # pick a feature order
+
                     feat_art = (m.get("features") if isinstance(m, dict) else None)
                     feat_model = getattr(estimator, "feature_names_in_", None)
                     feature_order: List[str] = (
-                        _as_list(feat_art) or _as_list(feat_model) or [c for c in X_all.columns if c not in ("geo_code","year")]
+                        _as_list(feat_art) or _as_list(feat_model)
+                        or [c for c in X_all.columns if c not in ("geo_code", "year")]
                     )
+
                     max_cov_year = int(df_base["year"].max())
-                    # only project if user asked beyond coverage
                     if end > max_cov_year:
                         future_rows = _future_feature_rows_for_download(
                             estimator=estimator,
@@ -896,15 +1020,14 @@ def features_compare(geo: str, start: int, end: int, model: str = "linear"):
                             end_year=end,
                             use_delta=bool(m.get("use_delta")) if isinstance(m, dict) else False,
                         )
-                        # map feature columns to indicator codes
-                        col_map = {"unemployment_rate": "BLS_UNRATE", "rent_cpi_index": "CPI_SHELTER"}
+
+                        # map feature columns to indicator codes for projections
+                        col_map = {bls_col: "BLS_UNRATE", cpi_col: "CPI_SHELTER"}
                         for col, code in col_map.items():
                             if col in future_rows.columns:
                                 for _, r in future_rows.iterrows():
                                     projections[code][int(r["year"])] = float(r[col])
 
-                        #future population estimates
-                        pop_proj: Dict[int, float] = {}
                         if not future_rows.empty and "population_implied" in future_rows.columns:
                             for _, r in future_rows.iterrows():
                                 y = int(r["year"])
@@ -912,8 +1035,9 @@ def features_compare(geo: str, start: int, end: int, model: str = "linear"):
                                 if pd.notna(v):
                                     pop_proj[y] = float(v)
 
-    # 3) shape response across the full [start, end] range
-    years = list(range(int(start), int(end) + 1))
+    # -------------------------
+    # 4) Shape response across the full [start, end] range
+    # -------------------------
     def series_for(code: str, include_projection: bool) -> Dict[str, Any]:
         actual = [actual_by_code.get(code, {}).get(y, None) for y in years]
         projected = [projections.get(code, {}).get(y, None) if include_projection else None for y in years]
@@ -921,10 +1045,10 @@ def features_compare(geo: str, start: int, end: int, model: str = "linear"):
 
     def series_pop_projected() -> Dict[str, Any]:
         projected = [pop_proj.get(y, None) for y in years]
-        return {"code": "POPULATION_IMPLIED", "years": years, "actual": [None]*len(years), "projected": projected}
+        return {"code": "POPULATION_IMPLIED", "years": years, "actual": [None] * len(years), "projected": projected}
 
     return {
-        "geography": geo,
+        "Geography": geo,
         "start": start,
         "end": end,
         "model_for_projection": model,
@@ -933,9 +1057,10 @@ def features_compare(geo: str, start: int, end: int, model: str = "linear"):
             series_for("ACS5_TOTAL_POP", include_projection=False),
             series_for("BLS_UNRATE",     include_projection=True),
             series_for("CPI_SHELTER",    include_projection=True),
-            series_pop_projected(),   # <-- NEW
+            series_pop_projected(),
         ],
     }
+
 
 def run():
     import uvicorn

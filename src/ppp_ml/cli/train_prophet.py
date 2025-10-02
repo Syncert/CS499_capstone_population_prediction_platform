@@ -4,7 +4,7 @@ import pandas as pd
 from prophet import Prophet
 
 from ppp_ml.hashers import dataframe_hash
-from ppp_ml.artifacts import record_run_start, record_metrics, record_forecasts, finish_and_point_artifact, capture_env, ensure_artifact_row
+from ppp_ml.artifacts import record_run_start, record_metrics, record_forecasts, finish_and_point_artifact, capture_env, ensure_artifact_row, save_model_artifact
 from ppp_ml.db import load_feature_matrix   # your existing accessor
 from ppp_ml.training_io import attach_actuals, basic_test_metrics, select_numeric_features
 
@@ -73,6 +73,14 @@ def main():
         split_year=args.split_year, horizon=args.horizon,
         params={"used_regressors": regressors}, env=capture_env()
     )
+
+    # Write artifact for API to load later (JSON at models/prophet/prophet_model_<geo>.json)
+    artifact_path = save_model_artifact(
+        model_name="prophet",
+        geo=args.geo,
+        prophet_model=m,
+    )
+    print(f"[ARTIFACT] {artifact_path}")
 
     # Persist metrics & forecasts
     record_metrics(run_id, basic_test_metrics(forecast_df))

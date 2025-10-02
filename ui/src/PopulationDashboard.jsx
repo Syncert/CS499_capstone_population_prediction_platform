@@ -1,4 +1,5 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useState, useEffect, useRef } from "react";
+import { Chart } from "chart.js";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -10,15 +11,48 @@ import "chart.js/auto";
 import GeoPickers from "./GeoPickers.jsx";
 
 // --- Quick notes -------------------------------------------------------------
-// 1) Drop this file into a Vite React app as src/PopulationDashboard.jsx.
-// 2) Install deps: npm i react-chartjs-2 chart.js jwt-decode
-//    (shadcn/ui is assumed available per the canvas environment; if not, swap to plain inputs/divs.)
-// 3) Set API_BASE to your FastAPI host (e.g., http://localhost:8000 or http://127.0.0.1:8000).
-// 4) The component logs in to FastAPI (/login), stores the JWT, and then calls /predict for
+// 1) Set API_BASE to your FastAPI host (e.g., http://localhost:8000 or http://127.0.0.1:8000).
+// 2) The component logs in to FastAPI (/login), stores the JWT, and then calls /predict for
 //    each selected model. It renders a multi-series line chart comparing forecasts.
 // ----------------------------------------------------------------------------
 
-const API_BASE_DEFAULT = "http://localhost:8000";
+// === Chart wrapper so Chart.js can fill width reliably ===
+function ChartBox({ data, options }) {
+  return (
+    <div className="chart-box">
+      <Line data={data} options={{ responsive: true, maintainAspectRatio: false, ...options }} />
+    </div>
+  );
+}
+
+// Force a resize pass after window or <details> changes
+function useForceChartResize() {
+  const raf = useRef();
+
+  useEffect(() => {
+    const bump = () => {
+      cancelAnimationFrame(raf.current);
+      raf.current = requestAnimationFrame(() => {
+        const instances = Chart.instances ? Object.values(Chart.instances) : [];
+        instances.forEach(c => c?.resize?.());
+      });
+    };
+
+    window.addEventListener("resize", bump);
+    const details = Array.from(document.querySelectorAll("details"));
+    details.forEach(d => d.addEventListener("toggle", bump));
+
+    return () => {
+      window.removeEventListener("resize", bump);
+      details.forEach(d => d.removeEventListener("toggle", bump));
+      cancelAnimationFrame(raf.current);
+    };
+  }, []);
+}
+
+// const API_BASE_DEFAULT = "http://localhost:8000"; //dev
+const API_BASE_DEFAULT = "/api"; //prod, nginx docker environment
+
 const ALL_MODELS = ["linear", "ridge", "xgb", "prophet"]; // toggle per your training
 
 function useApi(baseUrl) {
@@ -92,6 +126,9 @@ function useApi(baseUrl) {
 }
 
 export default function PopulationDashboard() {
+
+  useForceChartResize();
+
   // API/auth
   const [apiBase, setApiBase] = useState(API_BASE_DEFAULT);
   const api = useApi(apiBase);
@@ -437,12 +474,14 @@ const handleDownloadAllModels = async () => {
         <div className="card">
           <div className="card-body">
             {bestChart ? (
-              <Line data={bestChart} options={{
-                responsive: true,
+            <ChartBox
+              data={bestChart}
+              options={{
                 plugins: { legend: { position: "bottom" } },
                 interaction: { mode: "index", intersect: false },
                 scales: { x: { title: { display:true, text:"Year" } }, y: { title: { display:true, text:"Population" } } }
-              }} />
+              }}
+            />
             ) : (
               <div className="muted">Run “Fetch Predictions” to populate the best-model chart.</div>
             )}
@@ -456,12 +495,14 @@ const handleDownloadAllModels = async () => {
         <div className="card">
           <div className="card-body">
             {series.length ? (
-              <Line data={allModelsChart} options={{
-                responsive: true,
+            <ChartBox
+              data={allModelsChart}
+              options={{
                 plugins: { legend: { position: "bottom" } },
                 interaction: { mode: "index", intersect: false },
                 scales: { x: { title: { display:true, text:"Year" } }, y: { title: { display:true, text:"Population" } } }
-              }} />
+              }}
+            />
             ) : (
               <div className="muted">No series yet. Click “Fetch Predictions”.</div>
             )}
@@ -537,12 +578,14 @@ const handleDownloadAllModels = async () => {
               <div className="card">
                 <div className="card-body">
                   <div className="h3">ACS Population (1-year vs 5-year)</div>
-                  <Line data={data} options={{
-                    responsive: true,
-                    plugins: { legend: { position: "bottom" } },
-                    interaction: { mode: "index", intersect: false },
-                    scales: { x: { title: { display: true, text: "Year" } }, y: { title: { display: true, text: "Population" } } }
-                  }} />
+                  <ChartBox
+                    data={data}
+                    options={{
+                      plugins: { legend: { position: "bottom" } },
+                      interaction: { mode: "index", intersect: false },
+                      scales: { x: { title: { display:true, text:"Year" } } }
+                    }}
+                  />
                 </div>
               </div>
             );
