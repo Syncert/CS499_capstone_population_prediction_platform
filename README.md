@@ -383,21 +383,6 @@ GID=1000
 
 # --- Ports (host -> container)
 API_PORT=8000               # FastAPI exposed port
-UI_PORT=8080                # Nginx/React exposed port
-
-# --- Auth for API
-API_USERNAME=admin
-API_PASSWORD=changeme
-API_JWT_SECRET=super-secret-key
-API_JWT_TTL_SECONDS=3600
-
-# --- DB
-POSTGRES_DB=ppp
-POSTGRES_USER=ppp
-POSTGRES_PASSWORD=ppp
-DB_HOST=db
-DB_PORT=5432
-```
 
 ---
 
