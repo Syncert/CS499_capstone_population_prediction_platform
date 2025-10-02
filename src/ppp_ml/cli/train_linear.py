@@ -4,7 +4,7 @@ import pandas as pd
 from sklearn.linear_model import LinearRegression
 
 from ppp_ml.hashers import dataframe_hash
-from ppp_ml.artifacts import record_run_start, record_metrics, record_forecasts, finish_and_point_artifact, capture_env, ensure_artifact_row
+from ppp_ml.artifacts import record_run_start, record_metrics, record_forecasts, finish_and_point_artifact, capture_env, ensure_artifact_row, save_model_artifact
 from ppp_ml.db import load_feature_matrix
 from ppp_ml.training_io import attach_actuals, basic_test_metrics, select_numeric_features
 
@@ -61,6 +61,17 @@ def main():
         split_year=args.split_year, horizon=args.horizon,
         params={"features": feature_cols}, env=capture_env()
     )
+
+    # write model artifact for API to load later
+    artifact_path = save_model_artifact(
+        model_name="linear",
+        geo=args.geo,
+        estimator=model,
+        features=feature_cols,
+        use_delta=False,          # set True if your API expects delta-style models
+        rename_map=None,
+    )
+    print(f"[ARTIFACT] {artifact_path}")
 
     record_metrics(run_id, basic_test_metrics(forecast_df))
     record_forecasts(run_id, args.geo, "linear", forecast_df)

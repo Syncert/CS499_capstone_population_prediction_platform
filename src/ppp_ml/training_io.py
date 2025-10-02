@@ -9,7 +9,15 @@ from sklearn.metrics import r2_score
 AGG_FOLD = -1  # aggregate metric (non-CV)
 
 # Columns we never want as features
-EXCLUDE_COLS = ("year", "population", "geo_code")
+EXCLUDE_COLS = (
+    "year",
+    "population",
+    "geo_code",
+    "pop_ma3",
+    "pop_yoy_growth_pct",
+    "pop_cagr_5yr_pct",
+    "has_full_features"
+)
 
 def select_numeric_features(df: pd.DataFrame, exclude: tuple[str, ...] = EXCLUDE_COLS) -> list[str]:
     """

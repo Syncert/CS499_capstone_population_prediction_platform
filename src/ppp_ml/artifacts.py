@@ -1,15 +1,16 @@
 from __future__ import annotations
-
 import json
 import time
 from datetime import datetime
 from typing import Iterable, Optional
-
 import pandas as pd
 from sqlalchemy import text
 import sqlalchemy as sa
-
+from pathlib import Path
+import os
+import pickle
 from ppp_common.orm import engine  # your existing Engine factory
+
 
 def capture_env() -> dict:
     import platform, sys, subprocess
@@ -183,3 +184,63 @@ def finish_and_point_artifact(run_id: str) -> None:
               and a.geo_code = r.geo_code
               and a.model    = r.model
         """), {"rid": run_id})
+
+def _models_dir() -> Path:
+    # where FastAPI looks by default
+    return Path(os.getenv("MODELS_DIR", "models"))
+
+def artifact_path_for(model: str, geo: str) -> Path:
+    """
+    Filesystem path we write to, matching what the API loader expects.
+      - sklearn/xgb: models/<model>/<geo>.pkl
+      - prophet:     models/prophet/prophet_model_<geo>.json
+    """
+    base = _models_dir()
+    if model.lower() == "prophet":
+        return base / "prophet" / f"prophet_model_{geo}.json"
+    else:
+        return base / model.lower() / f"{model.lower()}_{geo}.pkl"
+
+def save_model_artifact(
+    model_name: str,
+    geo: str,
+    *,
+    estimator=None,
+    features: list[str] | None = None,
+    use_delta: bool | None = None,
+    rename_map: dict[str, str] | None = None,
+    prophet_model=None,                 # if model_name == "prophet"
+) -> str:
+    """
+    Write the model to disk in the exact structure the API expects and
+    return the absolute path as a string.
+
+    For sklearn/xgb:
+      payload = {"model": estimator, "features": [...], "use_delta": bool?, "rename_map": {...}?}
+
+    For prophet:
+      write JSON using prophet.serialize.model_to_json, file name prophet_model_<geo>.json
+    """
+    out = artifact_path_for(model_name, geo)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    if model_name.lower() == "prophet":
+        if prophet_model is None:
+            raise ValueError("save_model_artifact: prophet_model is required for 'prophet'")
+        # defer import to avoid hard dependency elsewhere
+        from prophet.serialize import model_to_json
+        out.write_text(model_to_json(prophet_model), encoding="utf-8")
+    else:
+        if estimator is None:
+            raise ValueError("save_model_artifact: estimator is required for non-prophet models")
+        payload = {"model": estimator}
+        if features is not None:
+            payload["features"] = list(features)
+        if use_delta is not None:
+            payload["use_delta"] = bool(use_delta)
+        if rename_map:
+            payload["rename_map"] = dict(rename_map)
+        with out.open("wb") as f:
+            pickle.dump(payload, f)
+
+    return str(out.resolve())

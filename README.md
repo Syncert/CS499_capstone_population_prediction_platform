@@ -1,4 +1,20 @@
-# syncert.github.io
+# syncert.github.io/population_prediction_platform_capstone
+
+# Professional Self-Assessment
+
+Completing my computer science degree and building my ePortfolio has allowed me to demonstrate not only technical ability but also the professional skills that make those abilities meaningful in real-world contexts. Over the past several years, I have grown from a data analyst focused on descriptive reporting into a computer science professional able to design software systems, develop predictive algorithms, and build secure, scalable applications.
+
+Collaboration has been central to that journey. Many of the course projects required picking up incomplete or unfamiliar codebases, debugging them, and extending them under tight timelines. That experience mirrors industry work, where teamwork often means inheriting and improving systems rather than starting from scratch. In my capstone project—the Population Prediction Platform—I extended this idea by containerizing the application and deploying it as a web-based tool so that diverse audiences could access forecasts and contribute feedback.
+
+I have also grown in my ability to communicate with stakeholders. Throughout the program, I learned how to translate technical complexity into clear visuals, narratives, and recommendations. In the capstone, React and Chart.js dashboards transform model metrics into accessible insights, showing not just predictions but also the trade-offs between models. This approach reflects my broader professional value: technical solutions only create impact when they are communicated effectively and transparently.
+
+My work in algorithms and data structures began with reinforcement learning but expanded into regression, time-series forecasting. Alongside this, I practiced making design trade-offs—choosing between accuracy, scalability, and performance—while applying efficient data processing with Pandas and Polars. These skills demonstrate the ability to balance theory with practical implementation.
+
+In software engineering and databases, I designed and deployed a normalized PostgreSQL schema, developed ETL pipelines to ingest Census/BLS/FRED data, and exposed that data through a secure FastAPI service. These artifacts show my ability to structure and manage large-scale data pipelines while maintaining performance and reproducibility. Security was a continuous thread, from authentication and container hardening to considering risks like adversarial data poisoning in machine learning workflows.
+
+Taken together, the artifacts in my ePortfolio tell a cohesive story. The algorithmic work highlights my foundation in predictive modeling. The database enhancements illustrate my ability to manage and optimize large datasets. The full-stack application demonstrates how I can integrate these skills into a complete, secure, and professional product.
+
+Most importantly, the program has helped shape my professional goals. I now target roles such as Analytics Engineer or Data Scientist—positions that combine data science and software engineering to deliver impactful solutions. The portfolio reflects my commitment to building systems that are collaborative, transparent, and secure, and it shows my readiness to contribute to organizations at the intersection of analytics and engineering.
 
 
 # Population Prediction Platform (CS 499 Capstone Project)
@@ -6,8 +22,18 @@
 ## 📖 Project Overview
 This project builds on my artifact from **CS 370 – Emerging Trends in Computer Science**, where I implemented a Q-learning algorithm to solve a treasure maze. The capstone transforms that prototype into a **full-fledged Population Prediction Platform**, combining **software engineering, predictive algorithms, and database design**.  
 
-The platform forecasts U.S. population trends using multiple algorithms, provides professional-quality visualizations, and supports both **web and desktop deployments** (via React and Tauri). It integrates with the U.S. Census API and leverages modern data engineering and machine learning practices.
+The platform forecasts U.S. population trends using multiple algorithms, provides professional-quality visualizations **web deployment** (via React). It integrates with the U.S. Census API and leverages modern data engineering and machine learning practices.
 
+# 📷 Screenshots:
+- UI
+![Screenshot](artifacts/screenshots/screenshot_1.png)
+![Screenshot](artifacts/screenshots/screenshot_2.png)
+![Screenshot](artifacts/screenshots/screenshot_3.png)
+![Screenshot](artifacts/screenshots/screenshot_4.png)
+![Screenshot](artifacts/screenshots/screenshot_5.png)
+![Screenshot](artifacts/screenshots/screenshot_6.png)
+- FastAPI Documentation
+![Screenshot](artifacts/screenshots/screenshot_7.png)
 ---
 
 ## 🎯 Goals
@@ -28,7 +54,7 @@ The platform forecasts U.S. population trends using multiple algorithms, provide
 [![Watch the code review](https://img.youtube.com/vi/1Ghb1E5JotU/hqdefault.jpg)](https://youtu.be/1Ghb1E5JotU)
 
 ### 1. Software Engineering & Design
-- **Enhancement**: Build a containerized web + desktop application with interactive charts (React + Chart.js, Tauri).  
+- **Enhancement**: Build a containerized web application with interactive charts (React + Chart.js).  
 - **Outcomes Demonstrated**:  
   - Collaborative environments (Docker deployment).  
   - Professional-quality visuals (React front-end).  
@@ -106,7 +132,7 @@ This project will be completed over **6 weeks**, with deliverables including:
 2. PostgreSQL schema + data ingestion.  
 3. Predictive algorithms (linear regression, forecasting, deep Q-learning).  
 4. FastAPI back-end with authentication.  
-5. React/Tauri front-end with charts.  
+5. React front-end with charts.  
 6. Final containerized stack, documentation, and presentation.  
 
 ---
@@ -114,8 +140,7 @@ This project will be completed over **6 weeks**, with deliverables including:
 ## 📂 Repository Structure
 ```plaintext
 /PopulationPredictionPlatform
-├── data/         # Raw & processed Census data
-├── models/       # Trained model artifacts
+├── models/       # Trained model artifacts (.pkl and .json for prophet)
 ├── notebooks/    # Prototyping and experimentation
 ├── api/          # FastAPI service
 ├── ui/           # React + Tauri front-end
@@ -125,10 +150,14 @@ This project will be completed over **6 weeks**, with deliverables including:
 │   └── ppp_api/    # storage of code for api
 │   └── ppp_common/ # storage of code for common-use across platform
 │   └── ppp_etl/    # storage of all etl scripts
+│   └── ppp_ml/    # storage of all ml scripts
 ├── artifacts/    # Documentation and original .ipynb file
 │   └── images/   # Exported diagrams and figures
 ├── docker-compose.yml
-└── requirements.txt
+├── .env_example
+├── Makefile
+└── pyproject.toml
+
 ```
 
 ---
@@ -297,11 +326,9 @@ A leaderboard view (`ml.model_leaderboard`) summarizes headline metrics, and the
 `ml.model_artifacts.best_run_id` is set to the **lowest test RMSE** for that (geo, model).
 
 ### What we’ve observed on annual population
-- **Linear / Ridge**: consistently best on test RMSE and R² (often R² > 0.93; states/counties higher).
-  They capture the smooth, near-linear trend of annual population with minimal variance.
-- **XGBoost**: solid but usually behind Ridge/Linear; helpful when there’s mild nonlinearity.
-- **Prophet**: not ideal for short, annual series with no seasonality; can underperform (even negative R²).
-  We keep it in the tournament, but selection is purely metric-based.
+- **Linear / Ridge**: 
+- **XGBoost**: 
+- **Prophet**: 
 
 ### Metric definitions (test split)
 - **RMSE** (lower is better): `sqrt(mean((yhat - actual)^2))`
@@ -314,3 +341,142 @@ We recompute “best” directly from `ml.model_metrics` (no dependency on MV fr
 - `ml.model_artifacts.latest_run_id` always points to the most recent successful run.
 
 **Serving default:** use `best_run_id` for all read paths unless a caller explicitly asks for a specific run.
+
+
+# ⚙️ Install & Run
+
+## 1. Prerequisites
+- **Docker** + **Docker Compose**
+- **Make** (optional, but all commands below use the provided `Makefile`)
+- **Git**
+- (Optional) `curl` for quick health checks
+
+---
+
+## 2. Configure Environment
+Copy the example environment file, rename it to `.env`, and update values for your machine:
+
+```bash
+cp .env_example .env
+```
+
+### Required Environment Variables
+
+```ini
+# --- Postgres
+POSTGRES_USER=admin        #if this is updated you need to update the default api password in ui > src > PopulationDashboard.jsx
+POSTGRES_PASSWORD=changeme #if this is updated you need to update the default api password in ui > src > PopulationDashboard.jsx
+POSTGRES_DB=populationdb
+POSTGRES_PORT=5432
+
+# --- API
+API_PORT=8000
+
+# --- Data API Keys
+CENSUS_API_KEY=INSERT_KEY                # https://api.census.gov/data/key_signup.html
+BUREAU_LABOR_STATISTICS_KEY=INSERT_KEY   # https://data.bls.gov/registrationEngine/
+FRED_KEY=INSERT_KEY                      # https://fred.stlouisfed.org/docs/api/api_key.html
+
+# --- User permissions
+UID=1000
+GID=1000
+
+# --- Ports (host -> container)
+API_PORT=8000               # FastAPI exposed port
+
+---
+
+## 3. One-Shot Bootstrap (fresh DB → ETL → train → health check)
+From the repo root:
+
+```bash
+make bootstrap
+```
+
+### What it does:
+1. `docker compose down -v` (wipe containers & volumes)
+2. `docker compose up -d --build` (build + start)
+3. Waits for Postgres to accept connections
+4. Runs ETL jobs (ACS, BLS, FRED)
+5. Trains models (Prophet, Linear, Ridge, XGB)
+6. Pings the API health endpoint
+
+When finished (assuming default ports):
+- **UI**: [http://localhost](http://localhost)
+- **API**: [http://localhost:8000](http://localhost:8000)
+  - /docs for documentation
+  - /health for health check and models loaded
+
+The UI talks to the API via same-origin `/api` through Nginx (no CORS headaches).
+
+---
+
+## 4. Useful Make Targets
+```bash
+make up         # Build & start (no wipe)
+make down       # Stop
+make clean      # Stop and wipe volumes (DB reset)
+make logs       # Follow all logs
+make etl-all    # Run all ETL jobs inside the API container
+make train      # Train all geos/models
+```
+
+Quick API check:
+
+```bash
+curl -sf http://localhost:${API_PORT:-8000}/health && echo "API healthy ✅"
+```
+
+---
+
+## 5. Nightly Training (Optional)
+Install a daily cron job (default: 02:30). Logs go to `./logs/train_YYYY-MM-DD.log`.
+
+```bash
+make cron-install   # install daily job
+make cron-test      # test every 2 mins
+make cron-remove    # remove job
+```
+
+---
+
+## 6. First-Run Login (UI)
+1. Open the UI (ping localhost) → API Base should be `/api`
+2. Login with `API_USERNAME` / `API_PASSWORD` from `.env`
+3. Pick a geography, set a year range, and click **Fetch Predictions**
+4. Use **Download data bundle** to get a ZIP with indicators, features, and predictions
+
+---
+
+## 7. Troubleshooting
+
+**UI loads but login fails**
+- Ensure the UI is calling `/api/...` (same origin).  
+- Nginx proxies `/api` → `api:8000`.  
+- If you changed ports, re-check your compose and reverse proxy config.
+
+**Models not writing to disk**
+```bash
+echo "UID=$(id -u)" >> .env
+echo "GID=$(id -g)" >> .env
+mkdir -p models artifacts && chmod -R u+rw models artifacts
+make down && make up
+```
+
+**Old code appears after changes**
+```bash
+make down
+make up      # includes --build
+```
+
+**Database is out of sync**
+```bash
+make clean
+make up
+make etl-all
+make train
+```
+
+---
+
+That’s it—happy forecasting!
