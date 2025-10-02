@@ -7,6 +7,9 @@ refresh-feature-matrix:  ## Refresh ml.feature_matrix (tries CONCURRENTLY, falls
 	@$(DB) sh -lc 'psql -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "REFRESH MATERIALIZED VIEW CONCURRENTLY ml.feature_matrix;" \
 	  || psql -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -c "REFRESH MATERIALIZED VIEW ml.feature_matrix;"'
 
+restart-api: ## Restart only the API container (no deps, no DB wipe)
+	$(COMPOSE) restart --no-deps api
+
 up:        ## Build & start
 	$(COMPOSE) up -d --build
 down:      ## Stop
@@ -27,12 +30,15 @@ etl-all:   ## Run all ETL jobs
 
 train:     ## Train all geos/models (drift-aware)
 	$(API) ppp-ml-train-all-models --min-years 8 --split-year 2020 --horizon 10
+	$(MAKE) restart-api
 
 train-dry: ## Dry-run training plan
 	$(API) ppp-ml-train-all-models --dry-run
+	$(MAKE) restart-api
 
 train-force: ## Force retrain all geos/models (ignore drift)
 	$(API) ppp-ml-train-all-models --min-years 8 --split-year 2020 --horizon 10 --force
+	$(MAKE) restart-api
 
 bootstrap: ## Fresh start -> ETL -> train -> smoke test
 	$(COMPOSE) down -v
