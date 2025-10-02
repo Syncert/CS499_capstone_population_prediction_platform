@@ -364,8 +364,8 @@ cp .env_example .env
 
 ```ini
 # --- Postgres
-POSTGRES_USER=user
-POSTGRES_PASSWORD=supersecretpassword
+POSTGRES_USER=admin        #if this is updated you need to update the default api password in ui > src > PopulationDashboard.jsx
+POSTGRES_PASSWORD=changeme #if this is updated you need to update the default api password in ui > src > PopulationDashboard.jsx
 POSTGRES_DB=populationdb
 POSTGRES_PORT=5432
 
